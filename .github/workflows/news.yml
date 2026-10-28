@@ -52,6 +52,7 @@ jobs:
           TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TRANSLATE_TO: ru
+          PYTHONUNBUFFERED: "1"
 
       - name: Save state
         if: always()
