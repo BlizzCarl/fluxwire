@@ -48,6 +48,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # переводчик
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 FULL_TEXT = os.getenv("FULL_TEXT", "1") == "1"  # полный перевод статьи в Telegraph по кнопке
 MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "15000"))  # длиннее — в Telegraph идёт начало
+MIN_IMAGE_WIDTH = int(os.getenv("MIN_IMAGE_WIDTH", "600"))  # миниатюры уже этого из ленты не берём
+MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "30000"))  # картинка легче — скорее всего мутная
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "12"))  # старее — не берём в очередь
 POOL_HOURS = int(os.getenv("POOL_HOURS", "14"))  # сколько сюжет ждёт в очереди, потом выбрасывается
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»: столько ждём перепечаток и топов
@@ -134,19 +136,30 @@ def skip_entry(link, title, extra_skip=()):
     return any(p in link for p in [*SKIP_URL, *extra_skip]) or any(w in title for w in SKIP_TITLE)
 
 
+def _width(value):
+    value = str(value or "")
+    return int(value) if value.isdigit() else 0
+
+
 def entry_image(entry):
+    """Самая большая картинка из ленты: (адрес, ширина; 0 — неизвестна)."""
+    best = (None, -1)
     for media in entry.get("media_content", []) + entry.get("media_thumbnail", []):
         url = media.get("url", "")
         if url.startswith("http") and media.get("medium", "image") == "image" \
                 and not media.get("type", "image/").startswith("video"):
-            return url
+            width = _width(media.get("width"))
+            if width > best[1]:
+                best = (url, width)
+    if best[0]:
+        return best
     for link in entry.get("links", []):
         if link.get("rel") == "enclosure" and link.get("type", "").startswith("image"):
-            return link.get("href")
+            return link.get("href"), 0
     img = BeautifulSoup(entry.get("summary", ""), "html.parser").find("img")
     if img and img.get("src", "").startswith("http"):
-        return img["src"]
-    return None
+        return img["src"], _width(img.get("width"))
+    return None, 0
 
 
 def rss_paragraphs(entry):
@@ -174,6 +187,7 @@ def fetch_feed(category, source):
             continue
         ts = entry.get("published_parsed") or entry.get("updated_parsed")
         summary = clean_text(entry.get("summary"))
+        image, image_width = entry_image(entry)
         items.append({
             "category": category["key"],
             "source": source["name"],
@@ -181,7 +195,8 @@ def fetch_feed(category, source):
             "title": title,
             "link": link,
             "summary": summary,
-            "image": entry_image(entry),
+            "image": image,
+            "image_width": image_width,
             "date": datetime(*ts[:6], tzinfo=timezone.utc) if ts else None,
             "rss_paragraphs": rss_paragraphs(entry),
             "text": dedup.story_text(title, summary),
@@ -216,7 +231,9 @@ def fetch_article(url):
                                include_tables=False, favor_precision=True) or ""
     return {
         "paragraphs": [p.strip() for p in text.split("\n") if len(p.strip()) > 1],
-        "image": meta("og:image"),
+        # Картинки для соцсетей у изданий обычно 1200 px и больше
+        "images": [u for u in (meta("og:image"), meta("twitter:image"), meta("twitter:image:src"))
+                   if u and u.startswith("http")],
         "description": clean_text(meta("og:description")),
     }
 
@@ -432,6 +449,50 @@ def choose(pool, order, now):
     return None
 
 
+REPEAT_PROMPT = """Ты — выпускающий редактор новостного канала. Ниже новая новость и список \
+уже опубликованных за последние двое суток.
+Повтор — если новость о том же событии или том же инфоповоде, даже под другим углом: \
+обзор, первые впечатления, цены, характеристики, реакция, подробности. \
+Например, «Apple представила новый MacBook» и «Обзор нового MacBook» — повтор.
+Не повтор — только если произошло действительно новое событие.
+Ответь JSON: {"repeat": номер опубликованной новости, которую она повторяет, или 0}.
+
+"""
+
+
+def is_repeat(story, recent):
+    """Заголовок уже опубликованной новости о том же событии или None.
+    Сначала быстрое сравнение по смыслу, в спорных случаях решает Gemini."""
+    if not recent:
+        return None
+    titles = [m["title"] for m in story["members"]]
+    recent = recent[-500:]  # последние сюжеты — этого хватает и не замедляет запуск
+    old = [r["title"] for r in recent]
+    sims, semantic = dedup.similarity(titles, old)
+    best = sims.max(axis=0)  # сходство каждой опубликованной новости с ближайшей статьёй сюжета
+    loose = 0.45 if semantic else 0.25  # мягкий порог: кандидаты на проверку
+    close = [int(j) for j in np.argsort(-best)[:8] if best[j] >= loose]
+    if not close:
+        return None
+    for j in close:
+        for i, title in enumerate(titles):
+            if dedup.same_story(sims[i, j], title, old[j], semantic):
+                return old[j]
+    if not GEMINI_API_KEY:
+        return None
+    main = story["members"][0]
+    text = (f"Новая: {main['title']} — {main['summary'][:300]}\n\nОпубликованные:\n"
+            + "\n".join(f"{n}. {old[j]}" for n, j in enumerate(close, 1)))
+    try:
+        answer = gemini(REPEAT_PROMPT + text, {"type": "OBJECT", "properties": {"repeat": {"type": "INTEGER"}},
+                                               "required": ["repeat"]})
+        number = int(answer.get("repeat", 0))
+    except Exception as exc:
+        print(f"[!] не удалось проверить повтор: {exc}")
+        return None
+    return old[close[number - 1]] if 1 <= number <= len(close) else None
+
+
 # ---------- перевод ----------
 
 def is_russian(text, share=0.5):
@@ -637,9 +698,9 @@ def telegraph_page(title, paragraphs, image, item):
 
 # ---------- публикация ----------
 
-def tg(method, **params):
+def tg(method, files=None, **params):
     params["chat_id"] = CHANNEL_ID
-    data = requests.post(f"{TG_API}/{method}", data=params, timeout=30).json()
+    data = requests.post(f"{TG_API}/{method}", data=params, files=files, timeout=60).json()
     if not data.get("ok"):
         raise RuntimeError(f"{method}: {data.get('description')}")
     return data["result"]
@@ -688,13 +749,39 @@ def keyboard(page, sources):
     return json.dumps({"inline_keyboard": rows})
 
 
+def image_candidates(item, article):
+    """Картинка со страницы статьи (крупная) — первой; миниатюра из ленты — только если не мелкая."""
+    out = list(article.get("images", []))
+    width = item.get("image_width", 0)
+    if item.get("image") and (width == 0 or width >= MIN_IMAGE_WIDTH):
+        out.append(item["image"])
+    return list(dict.fromkeys(out))
+
+
+def download_image(urls):
+    """Первая картинка, которая скачалась и не слишком мала: (адрес, байты, тип) или None."""
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[!] картинка недоступна: {exc}")
+            continue
+        kind = resp.headers.get("Content-Type", "").split(";")[0].strip()
+        # Миниатюры весят единицы килобайт, нормальное фото — от 30 КБ
+        if kind in ("image/jpeg", "image/png", "image/webp") and MIN_IMAGE_BYTES <= len(resp.content) <= 10_000_000:
+            return url, resp.content, kind
+    return None
+
+
 def send_post(category, post, sources, image, markup):
     names = [name for name, _ in sources]
     if image:
+        _, data, kind = image
         try:
-            # Сверху — только картинка; подпись к фото до 1024 символов
-            tg("sendPhoto", photo=image, parse_mode="HTML", reply_markup=markup,
-               caption=build_post(category, post, names, 1024))
+            # Сверху — только картинка; файл загружаем сами, без пережатия чужим сервером
+            tg("sendPhoto", files={"photo": ("photo." + kind.split("/")[1], data, kind)},
+               parse_mode="HTML", reply_markup=markup, caption=build_post(category, post, names, 1024))
             return
         except Exception as exc:
             if any(s in str(exc) for s in FATAL_TG_ERRORS):
@@ -717,7 +804,7 @@ def publish(category, story):
     if sum(map(len, item["rss_paragraphs"])) > sum(map(len, paragraphs)):
         paragraphs = item["rss_paragraphs"]
     paragraphs = take_chars(paragraphs, MAX_ARTICLE_CHARS) if FULL_TEXT else []
-    image = item["image"] or article.get("image")
+    image = download_image(image_candidates(item, article))
 
     summary = item["summary"]
     if len(summary) < 80:
@@ -727,7 +814,7 @@ def publish(category, story):
     # Полный перевод — в Telegraph, по кнопке «Читать полностью»
     page = None
     if len(post["paragraphs"]) >= 3:
-        page = telegraph_page(post["title"], post["paragraphs"], image, item)
+        page = telegraph_page(post["title"], post["paragraphs"], image[0] if image else None, item)
     send_post(category, post, sources, image, keyboard(page, sources))
 
 
@@ -765,13 +852,20 @@ def run(only=None):
         order = CATEGORIES[start:] + CATEGORIES[:start]
         state["next_category"] = (start + 1) % len(CATEGORIES)
 
-    for _ in range(3):  # если статья не открылась, пробуем следующий сюжет
+    for _ in range(6):  # повтор или статья не открылась — пробуем следующий сюжет
         pooled = choose(state["pool"], order, now)
         if pooled is None:
             print("Важных новостей сейчас нет — слот пропущен")
             break
         story = as_story(pooled)
         category = CATEGORY_BY_KEY[pooled["category"]]
+        repeat = is_repeat(pooled, state["recent"])
+        if repeat:
+            # Тот же сюжет уже был в канале — выбрасываем и запоминаем, чтобы ловить следующие пересказы
+            print(f"[повтор] {story['main']['source']}: {story['main']['title']}  ≈  {repeat}")
+            state["pool"].remove(pooled)
+            remember(state, seen, story["members"])
+            continue
         try:
             publish(category, story)
         except TranslationError as exc:
