@@ -46,9 +46,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 TRANSLATE_TO = os.getenv("TRANSLATE_TO", "ru").strip()  # пусто — не переводить
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # переводчик и редактор-нейросеть
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-FULL_TEXT = os.getenv("FULL_TEXT", "1") == "1"  # полный текст в посте / в Telegraph
-SHORT_ARTICLE_CHARS = int(os.getenv("SHORT_ARTICLE_CHARS", "3500"))  # короче — целиком в посте
-LEAD_CHARS = int(os.getenv("LEAD_CHARS", "1500"))  # сколько текста длинной статьи показать в посте
+FULL_TEXT = os.getenv("FULL_TEXT", "1") == "1"  # полный перевод статьи в Telegraph по кнопке
+MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "15000"))  # длиннее — в Telegraph идёт начало
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "12"))  # старее — не берём в очередь
 POOL_HOURS = int(os.getenv("POOL_HOURS", "14"))  # сколько сюжет ждёт в очереди, потом выбрасывается
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»: столько ждём перепечаток и топов
@@ -532,6 +531,70 @@ def translate(parts, lang):
     return result
 
 
+# ---------- выжимка для поста ----------
+
+DIGEST_PROMPT = """Ты — редактор новостного Telegram-канала. Читатель листает ленту: \
+за 10 секунд он должен понять, что произошло и почему это важно, даже если впервые слышит об этой теме.
+Сделай по статье ниже JSON с полями (всё на русском):
+title — понятный заголовок до 100 символов. Сразу ясно, о ком или о чём речь: \
+не «Альтман ответил критикам», а «Глава OpenAI Сэм Альтман ответил на обвинения в…». \
+Малоизвестных людей, компании, игры, команды поясняй парой слов. Без кликбейта и вопросов.
+lead — суть в 2–3 коротких предложениях, до 320 символов: что случилось и почему это важно. \
+Без воды, вводных слов и повтора заголовка.
+points — 0–3 ключевых факта (цифры, сроки, последствия), каждый до 100 символов. \
+Не повторяй lead. Если добавить нечего — пустой массив.
+paragraphs — полный перевод абзацев статьи, столько же элементов и в том же порядке. \
+Пиши естественно, в стиле качественного издания. Имена и названия — как принято в русских СМИ.
+
+"""
+
+DIGEST_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "lead": {"type": "STRING"},
+        "points": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "paragraphs": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["title", "lead", "points", "paragraphs"],
+}
+
+
+def first_sentences(text, limit=320):
+    out = ""
+    for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()):
+        if out and len(out) + len(sentence) + 1 > limit:
+            break
+        out = f"{out} {sentence}".strip()
+    return shorten(out, limit)
+
+
+def digest(item, summary, paragraphs):
+    """Заголовок, суть в 2–3 предложениях, ключевые факты и полный перевод — одним запросом."""
+    if GEMINI_API_KEY and TRANSLATE_TO:
+        article = {"title": item["title"], "summary": summary, "paragraphs": paragraphs}
+        try:
+            data = gemini(DIGEST_PROMPT + json.dumps(article, ensure_ascii=False), DIGEST_SCHEMA)
+            title, lead = str(data["title"]).strip(), str(data["lead"]).strip()
+            points = [str(p).strip() for p in data.get("points", []) if str(p).strip()][:3]
+            if title and lead and (TRANSLATE_TO != "ru" or is_russian(f"{title} {lead}", share=0.3)):
+                full = [str(p) for p in data.get("paragraphs", [])]
+                if paragraphs and len(full) < len(paragraphs) * 0.8:
+                    try:  # перевод абзацев потерялся — переводим их отдельно
+                        full = translate(paragraphs, item["lang"])
+                    except TranslationError as exc:
+                        print(f"[!] полный текст не переведён, пост без «Читать полностью»: {exc}")
+                        full = []
+                return {"title": title, "lead": lead, "points": points, "paragraphs": full}
+            print("[!] выжимка вернулась не того формата, перевожу без неё")
+        except Exception as exc:
+            print(f"[!] не удалось сделать выжимку, перевожу без неё: {exc}")
+    # Запасной вариант: обычный перевод, суть — первые предложения описания
+    translated = translate([item["title"], summary, *paragraphs], item["lang"])
+    return {"title": translated[0], "lead": first_sentences(translated[1]), "points": [],
+            "paragraphs": translated[2:]}
+
+
 # ---------- Telegraph (полный текст внутри Telegram) ----------
 
 def telegraph_token():
@@ -589,91 +652,83 @@ def shorten(text, limit):
     return cut + "…"
 
 
-def take_paragraphs(paragraphs, limit):
+def take_chars(paragraphs, limit):
     """Первые целые абзацы, укладывающиеся в limit символов."""
     out, size = [], 0
     for paragraph in paragraphs:
-        if out and size + len(paragraph) + 2 > limit:
+        if out and size + len(paragraph) > limit:
             break
         out.append(paragraph)
-        size += len(paragraph) + 2
-    return "\n\n".join(out)
+        size += len(paragraph)
+    return out
 
 
-def build_post(category, title, body, source, limit, hot=(), footer_note=""):
-    head = f"{category['emoji']} <b>{html.escape(title)}</b>\n\n"
-    tail = f"{footer_note}\n\n"
-    if hot:
-        tail += f"🔥 <b>Об этом пишут:</b> {html.escape(', '.join(hot))}\n"
-    tail += f"📰 <i>{html.escape(source)}</i>  ·  #{category['tag']}"
-    room = limit - len(head) - len(tail) - 50  # запас на экранирование
-    return head + html.escape(shorten(body, room)) + tail
+def build_post(category, post, sources, limit):
+    """Короткий пост: заголовок, суть, до трёх фактов, источники и рубрика. Без ссылок в тексте."""
+    head = f"{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
+    names = " · ".join(sources[:4])
+    tail = f"\n\n<i>{html.escape(names)}</i>  #{category['tag']}"
+    lead, points = post["lead"], list(post["points"])
+    while True:
+        body = html.escape(lead)
+        if points:
+            body += "\n\n" + "\n".join(f"▪️ {html.escape(p)}" for p in points)
+        if len(head) + len(body) + len(tail) <= limit or (not points and len(lead) < 120):
+            return head + body + tail
+        if points:
+            points.pop()  # сначала убираем факты, суть оставляем
+        else:
+            lead = shorten(lead, len(lead) - 40)
 
 
-def keyboard(first_row, extra_row):
-    return json.dumps({"inline_keyboard": [first_row] + ([extra_row] if extra_row else [])})
+def keyboard(page, sources):
+    rows = [[{"text": "📖 Читать полностью", "url": page}]] if page else []
+    buttons = [{"text": f"🔗 {name}", "url": link} for name, link in sources[:4]]
+    rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return json.dumps({"inline_keyboard": rows})
 
 
-def send_text(text, preview_url, markup):
-    # Карточка ссылки над текстом: картинка статьи, у Telegraph — кнопка Instant View
-    tg("sendMessage", parse_mode="HTML", reply_markup=markup, text=text,
-       link_preview_options=json.dumps({"url": preview_url, "prefer_large_media": True,
-                                        "show_above_text": True}))
+def send_post(category, post, sources, image, markup):
+    names = [name for name, _ in sources]
+    if image:
+        try:
+            # Сверху — только картинка; подпись к фото до 1024 символов
+            tg("sendPhoto", photo=image, parse_mode="HTML", reply_markup=markup,
+               caption=build_post(category, post, names, 1024))
+            return
+        except Exception as exc:
+            if any(s in str(exc) for s in FATAL_TG_ERRORS):
+                raise
+            print(f"[!] не удалось отправить с фото, отправляю текстом: {exc}")
+    tg("sendMessage", parse_mode="HTML", reply_markup=markup,
+       text=build_post(category, post, names, 1500),
+       link_preview_options=json.dumps({"is_disabled": True}))
 
 
 def publish(category, story):
     item = story["main"]
-    others = {}
+    sources = {item["source"]: item["link"]}
     for member in story["members"]:
-        if member["source"] != item["source"]:
-            others.setdefault(member["source"], member)
-    hot = [item["source"], *others] if others else []
-    extra_row = [{"text": f"🔗 {m['source']}", "url": m["link"]} for m in list(others.values())[:3]]
-    source_button = {"text": f"🔗 {item['source']}", "url": item["link"]}
+        sources.setdefault(member["source"], member["link"])
+    sources = list(sources.items())
 
     article = fetch_article(item["link"])
     paragraphs = article.get("paragraphs", [])
     if sum(map(len, item["rss_paragraphs"])) > sum(map(len, paragraphs)):
         paragraphs = item["rss_paragraphs"]
-    if not FULL_TEXT:
-        paragraphs = []
+    paragraphs = take_chars(paragraphs, MAX_ARTICLE_CHARS) if FULL_TEXT else []
     image = item["image"] or article.get("image")
 
     summary = item["summary"]
     if len(summary) < 80:
         summary = article.get("description") or " ".join(paragraphs[:2]) or summary
-    # Заголовок, описание и текст переводятся одним запросом
-    translated = translate([item["title"], summary, *paragraphs], item["lang"])
-    title, summary, paragraphs = translated[0], translated[1], translated[2:]
-    full_text = "\n\n".join(paragraphs)
+    post = digest(item, summary, paragraphs)
 
-    # Короткая статья — целиком прямо в посте
-    if paragraphs and len(full_text) <= SHORT_ARTICLE_CHARS:
-        send_text(build_post(category, title, full_text, item["source"], 4096, hot),
-                  item["link"], keyboard([source_button], extra_row))
-        return
-
-    # Длинная — начало в посте, полный текст в Telegraph (Instant View)
-    if len(paragraphs) >= 3:
-        page = telegraph_page(title, paragraphs, image, item)
-        if page:
-            lead = take_paragraphs(paragraphs, LEAD_CHARS)
-            send_text(build_post(category, title, lead, item["source"], 4096, hot,
-                                 footer_note="\n\n⚡ <b>Полная статья — в Instant View выше</b>"),
-                      page, keyboard([{"text": "📖 Читать полностью", "url": page}, source_button],
-                                     extra_row))
-            return
-
-    # Полный текст не удалось получить — фото и краткое содержание
-    markup = keyboard([source_button], extra_row)
-    if image:
-        try:
-            tg("sendPhoto", photo=image, parse_mode="HTML", reply_markup=markup,
-               caption=build_post(category, title, summary, item["source"], 1024, hot))
-            return
-        except Exception as exc:
-            print(f"[!] не удалось отправить с фото, отправляю текстом: {exc}")
-    send_text(build_post(category, title, summary, item["source"], 1500, hot), item["link"], markup)
+    # Полный перевод — в Telegraph, по кнопке «Читать полностью»
+    page = None
+    if len(post["paragraphs"]) >= 3:
+        page = telegraph_page(post["title"], post["paragraphs"], image, item)
+    send_post(category, post, sources, image, keyboard(page, sources))
 
 
 def as_story(pooled):
