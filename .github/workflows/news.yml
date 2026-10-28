@@ -53,6 +53,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TRANSLATE_TO: ru
           PYTHONUNBUFFERED: "1"
+          MIN_SCORE: "8"
 
       - name: Save state
         if: always()
