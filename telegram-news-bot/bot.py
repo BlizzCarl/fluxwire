@@ -30,6 +30,8 @@ from feeds import CATEGORIES, SKIP_TITLE, SKIP_URL
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 TRANSLATE_TO = os.getenv("TRANSLATE_TO", "ru").strip()  # пусто — не переводить
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # переводчик-нейросеть (рекомендуется)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 FULL_TEXT = os.getenv("FULL_TEXT", "1") == "1"  # полный текст в посте / в Telegraph
 SHORT_ARTICLE_CHARS = int(os.getenv("SHORT_ARTICLE_CHARS", "3500"))  # короче — целиком в посте
 LEAD_CHARS = int(os.getenv("LEAD_CHARS", "1500"))  # сколько текста длинной статьи показать в посте
@@ -224,28 +226,48 @@ def is_russian(text, share=0.5):
     return not letters or sum(c >= "а" for c in letters) / len(letters) > share
 
 
+def _gemini_translate(parts):
+    """Перевод нейросетью Gemini: один запрос на всю статью, качество как у редактора.
+    Ключ бесплатный: https://aistudio.google.com/apikey"""
+    prompt = (
+        f"Переведи на язык «{TRANSLATE_TO}» каждую строку из JSON-массива. Это новостная статья: "
+        "пиши естественно, в стиле качественного новостного издания, без пояснений и сокращений. "
+        "Имена, названия компаний, игр и фильмов передавай так, как их принято писать в русских СМИ. "
+        "Ответь только JSON-массивом строк той же длины и в том же порядке.\n\n"
+        + json.dumps(parts, ensure_ascii=False)
+    )
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY},
+        json={"contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}},
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise TranslationError(f"Gemini {resp.status_code}: {resp.text[:300]}")
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    result = json.loads(text)
+    if not isinstance(result, list) or len(result) != len(parts):
+        raise TranslationError("Gemini вернул ответ не того формата")
+    return [str(r) for r in result]
+
+
 def _translate_chunk(translator, text):
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             return translator.translate(text) or text
         except Exception as exc:
-            if attempt == 2:
+            if attempt == 1:
                 raise TranslationError(exc)
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3)
 
 
-def translate(parts, lang):
-    """Переводит список строк, сохраняя разбиение.
-    Если перевести не удалось, бросает TranslationError: пост на чужом языке не выйдет,
-    новость останется в очереди до следующего запуска."""
-    if not TRANSLATE_TO or lang == TRANSLATE_TO or not parts:
-        return parts
-    if TRANSLATE_TO == "ru" and all(is_russian(p) for p in parts):
-        return parts  # источник уже на русском, даже если это не отмечено в feeds.py
+def _google_translate(parts):
+    """Бесплатный Google Translate — запасной вариант (с GitHub его часто блокируют)."""
     from deep_translator import GoogleTranslator
     translator = GoogleTranslator(source="auto", target=TRANSLATE_TO)
 
-    # Абзацы склеиваются в куски до 4500 символов: меньше запросов, быстрее, без блокировок
+    # Абзацы склеиваются в куски до 4500 символов: меньше запросов
     result, batch = [], []
 
     def flush():
@@ -257,6 +279,7 @@ def translate(parts, lang):
         else:  # переводчик изменил разбиение — переводим по одному абзацу
             result.extend(_translate_chunk(translator, p) for p in batch)
         batch.clear()
+        time.sleep(0.5)
 
     for part in parts:
         part = part.replace("\n", " ")
@@ -273,6 +296,32 @@ def translate(parts, lang):
             flush()
         batch.append(part)
     flush()
+    return result
+
+
+def translate(parts, lang):
+    """Переводит список строк, сохраняя разбиение.
+    Сначала Gemini (если задан GEMINI_API_KEY), при ошибке — бесплатный Google Translate.
+    Если не сработало ничего, бросает TranslationError: пост на чужом языке не выйдет,
+    новость останется в очереди до следующего запуска."""
+    if not TRANSLATE_TO or lang == TRANSLATE_TO or not parts:
+        return parts
+    if TRANSLATE_TO == "ru" and all(is_russian(p) for p in parts):
+        return parts  # источник уже на русском, даже если это не отмечено в feeds.py
+
+    result, errors = None, []
+    if GEMINI_API_KEY:
+        try:
+            result = _gemini_translate(parts)
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
+    if result is None:
+        try:
+            result = _google_translate(parts)
+        except Exception as exc:
+            errors.append(f"Google: {exc}")
+    if result is None:
+        raise TranslationError("; ".join(errors))
 
     # В переводе остаются латинские названия (iPhone, GTA), поэтому достаточно трети кириллицы
     if TRANSLATE_TO == "ru" and not is_russian(" ".join(result), share=0.3):
@@ -390,8 +439,9 @@ def publish(category, story):
     summary = item["summary"]
     if len(summary) < 80:
         summary = article.get("description") or " ".join(paragraphs[:2]) or summary
-    title, summary = translate([item["title"], summary], item["lang"])
-    paragraphs = translate(paragraphs, item["lang"])
+    # Заголовок, описание и текст переводятся одним запросом
+    translated = translate([item["title"], summary, *paragraphs], item["lang"])
+    title, summary, paragraphs = translated[0], translated[1], translated[2:]
     full_text = "\n\n".join(paragraphs)
 
     # Короткая статья — целиком прямо в посте
@@ -424,6 +474,7 @@ def publish(category, story):
 
 
 def post_category(category, state, seen, cutoff):
+    """Возвращает число опубликованных постов или -1, если недоступен переводчик."""
     sent, used_sources = 0, set()
     for story in pick_stories(category, state, seen, cutoff):
         if sent >= POSTS_PER_RUN:
@@ -434,8 +485,9 @@ def post_category(category, state, seen, cutoff):
         try:
             publish(category, story)
         except TranslationError as exc:
+            # Переводчик недоступен — не долбим его дальше, попробуем в следующий запуск
             print(f"[!] не удалось перевести, новость отложена до следующего запуска: {exc}")
-            continue
+            return -1
         except Exception as exc:
             print(f"[!] {main['link']}: {exc}")
             continue
@@ -450,6 +502,8 @@ def post_category(category, state, seen, cutoff):
 def run(only=None):
     if not BOT_TOKEN or not CHANNEL_ID:
         sys.exit("Задайте переменные окружения BOT_TOKEN и CHANNEL_ID (см. README)")
+    if not GEMINI_API_KEY:
+        print("[!] GEMINI_API_KEY не задан — перевожу бесплатным Google Translate (с GitHub его часто блокируют)")
     state = load_state()
     seen = set(state["posted"])
     cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
@@ -466,7 +520,11 @@ def run(only=None):
     for category in order:
         if not only:
             state["next_category"] = (CATEGORIES.index(category) + 1) % len(CATEGORIES)
-        if post_category(category, state, seen, cutoff):
+        result = post_category(category, state, seen, cutoff)
+        if result == -1:
+            print("[!] переводчик недоступен, публикация отложена до следующего запуска")
+            break
+        if result:
             break
         print(f"[{category['key']}] свежих новостей нет")
     save_state(state)
