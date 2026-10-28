@@ -47,6 +47,9 @@ HEADERS = {
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+# Ошибки Telegram, при которых публиковать бесполезно, пока не исправить настройки
+FATAL_TG_ERRORS = ("administrator rights", "chat not found", "Unauthorized", "bot was kicked",
+                   "not enough rights")
 
 
 # ---------- состояние (что уже опубликовано) ----------
@@ -236,20 +239,43 @@ def _gemini_translate(parts):
         "Ответь только JSON-массивом строк той же длины и в том же порядке.\n\n"
         + json.dumps(parts, ensure_ascii=False)
     )
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        headers={"x-goog-api-key": GEMINI_API_KEY},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}},
-        timeout=120,
-    )
-    if resp.status_code != 200:
-        raise TranslationError(f"Gemini {resp.status_code}: {resp.text[:300]}")
-    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    result = json.loads(text)
-    if not isinstance(result, list) or len(result) != len(parts):
-        raise TranslationError("Gemini вернул ответ не того формата")
-    return [str(r) for r in result]
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            # Строгая схема: массив строк, иначе модель иногда ломает JSON на длинных текстах
+            "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "temperature": 0.2,
+            "maxOutputTokens": 65536,
+        },
+    }
+    error = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(5 * attempt)
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=120,
+            )
+        except requests.RequestException as exc:
+            error = f"Gemini: {exc}"
+            continue
+        if resp.status_code != 200:
+            error = f"Gemini {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code in (400, 401, 403, 404):  # ключ или модель неверные — повтор не поможет
+                break
+            continue
+        try:
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            result = json.loads(text)
+        except (KeyError, IndexError, ValueError) as exc:
+            error = f"Gemini вернул испорченный ответ: {exc}"
+            continue
+        if isinstance(result, list) and len(result) == len(parts):
+            return [str(r) for r in result]
+        error = "Gemini вернул ответ не того формата"
+    raise TranslationError(error)
 
 
 def _translate_chunk(translator, text):
@@ -474,7 +500,8 @@ def publish(category, story):
 
 
 def post_category(category, state, seen, cutoff):
-    """Возвращает число опубликованных постов или -1, если недоступен переводчик."""
+    """Возвращает число опубликованных постов, -1 если недоступен переводчик,
+    -2 если бот не может писать в канал."""
     sent, used_sources = 0, set()
     for story in pick_stories(category, state, seen, cutoff):
         if sent >= POSTS_PER_RUN:
@@ -489,6 +516,11 @@ def post_category(category, state, seen, cutoff):
             print(f"[!] не удалось перевести, новость отложена до следующего запуска: {exc}")
             return -1
         except Exception as exc:
+            if any(s in str(exc) for s in FATAL_TG_ERRORS):
+                # Бот не может писать в канал — дальше переводить бессмысленно
+                print(f"[!] Telegram: {exc}\n    Сделайте бота администратором канала "
+                      "с правом «Публикация сообщений» и проверьте CHANNEL_ID (например, @fluxwirenews)")
+                return -2
             print(f"[!] {main['link']}: {exc}")
             continue
         remember(state, seen, story["members"])
@@ -523,6 +555,8 @@ def run(only=None):
         result = post_category(category, state, seen, cutoff)
         if result == -1:
             print("[!] переводчик недоступен, публикация отложена до следующего запуска")
+            break
+        if result == -2:
             break
         if result:
             break
