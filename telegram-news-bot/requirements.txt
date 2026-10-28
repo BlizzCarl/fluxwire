@@ -1,0 +1,7 @@
+feedparser>=6.0
+requests>=2.31
+beautifulsoup4>=4.12
+trafilatura>=1.8
+deep-translator>=1.11
+fastembed>=0.4
+numpy>=1.26
