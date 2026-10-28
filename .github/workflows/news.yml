@@ -50,6 +50,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TRANSLATE_TO: ru
 
       - name: Save state
