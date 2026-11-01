@@ -12,6 +12,9 @@
   5. Рубрики идут по кругу; если в рубрике нет важного, берётся важное из следующей.
   6. Раз в день в DIGEST_HOUR выходит дайджест: заголовки всех новостей с прошлого дайджеста.
   7. Если что-то сломалось, бот пишет об этом в личку (ADMIN_CHAT_ID).
+  8. Новые факты об уже опубликованном сюжете выходят «🔄 Обновлением» — ответом на старый пост.
+  9. Срочное (URGENT_SCORE) приходит с пометкой ⚡️ и звуком, остальное — без звука.
+ 10. В канале закреплена навигация по рубрикам; бот обновляет её сам, если рубрики изменились.
 
 Запуск:
     python bot.py                — один пост: для GitHub Actions / cron
@@ -65,6 +68,13 @@ POOL_HOURS = int(os.getenv("POOL_HOURS", "14"))  # сколько сюжет ж�
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»: столько ждём перепечаток и топов
 MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # минимальная оценка для публикации
 BREAKING_SCORE = float(os.getenv("BREAKING_SCORE", "13"))  # с такой оценкой — сразу, без ожидания
+URGENT_SCORE = float(os.getenv("URGENT_SCORE", "11"))  # с такой оценкой — пометка ⚡️ и звук уведомления
+SILENT_POSTS = os.getenv("SILENT_POSTS", "1") == "1"  # обычные посты приходят подписчикам без звука
+UPDATES = os.getenv("UPDATES", "1") == "1"  # новые факты о вышедшем сюжете — ответом на старый пост
+UPDATE_MAX = int(os.getenv("UPDATE_MAX", "3"))  # не больше стольких обновлений на один сюжет
+UPDATE_GAP_MIN = int(os.getenv("UPDATE_GAP_MIN", "60"))  # и не чаще раза в столько минут
+NAVIGATION = os.getenv("NAVIGATION", "1") == "1"  # закреплённое сообщение с рубриками
+CHANNEL_NAME = os.getenv("CHANNEL_NAME", "FLUX WIRE").strip()  # название канала в навигации
 DEDUP_HOURS = int(os.getenv("DEDUP_HOURS", "48"))  # сколько помнить сюжеты для отсева дублей
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "21"))  # час вечернего дайджеста; -1 — выключить
 DIGEST_TZ = os.getenv("DIGEST_TZ", "Europe/Moscow").strip()  # часовой пояс дайджеста
@@ -98,6 +108,7 @@ def load_state():
     state.setdefault("digest", [])   # опубликованное с прошлого дайджеста
     state.setdefault("alerts", {})   # когда о какой поломке уже писали
     state.setdefault("feed_fails", {})
+    state.setdefault("threads", {})  # сколько обновлений вышло к каждому посту
     state.setdefault("last_post", time.time())
     state.setdefault("next_category", 0)
     # Сюжеты из удалённых рубрик (например, «Бизнес») больше не публикуем
@@ -108,6 +119,7 @@ def load_state():
 def save_state(state):
     border = time.time() - DEDUP_HOURS * 3600
     state["recent"] = [r for r in state["recent"] if r["ts"] > border][-2000:]
+    state["threads"] = {k: v for k, v in state["threads"].items() if v["ts"] > border}
     state["posted"] = state["posted"][-8000:]
     state["digest"] = [d for d in state["digest"] if d["ts"] > time.time() - 36 * 3600][-300:]
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -129,11 +141,12 @@ def mark_seen(state, seen, item):
         state["posted"].append(key)
 
 
-def remember(state, seen, members):
+def remember(state, seen, members, msg=None):
+    """msg — номер поста в канале об этом сюжете: к нему будут приходить обновления."""
     now = time.time()
     for member in members:
         mark_seen(state, seen, member)
-        state["recent"].append({"ts": now, "title": member["title"], "text": member["text"]})
+        state["recent"].append({"ts": now, "title": member["title"], "text": member["text"], "msg": msg})
 
 
 def pack(item):
@@ -634,7 +647,7 @@ REPEAT_PROMPT = """Ты — выпускающий редактор новост
 
 
 def is_repeat(story, recent):
-    """Заголовок уже опубликованной новости о том же событии или None.
+    """Запись об уже опубликованной новости о том же событии ({title, msg, …}) или None.
     Сначала быстрое сравнение по смыслу, в спорных случаях решает Gemini."""
     if not recent:
         return None
@@ -650,7 +663,7 @@ def is_repeat(story, recent):
     for j in close:
         for i, title in enumerate(titles):
             if dedup.same_story(sims[i, j], title, old[j], semantic):
-                return old[j]
+                return recent[j]
     if not GEMINI_API_KEY:
         return None
     main = story["members"][0]
@@ -663,7 +676,7 @@ def is_repeat(story, recent):
     except Exception as exc:
         print(f"[!] не удалось проверить повтор: {exc}")
         return None
-    return old[close[number - 1]] if 1 <= number <= len(close) else None
+    return recent[close[number - 1]] if 1 <= number <= len(close) else None
 
 
 # ---------- перевод ----------
@@ -803,11 +816,18 @@ lead — краткий пересказ: что случилось, в 2 кор
 Без воды, вводных слов и повтора заголовка.
 points — 0–2 ключевых факта (цифры, сроки), каждый до 90 символов. \
 Не повторяй lead. Если добавить нечего — пустой массив.
-meaning — ответ на вопрос «Что это значит?»: 1–3 простых предложения, до 260 символов. \
-Объясни, что эта новость меняет и почему она важна, так, будто рассказываешь другу, \
-который совсем не разбирается в теме: без терминов и канцелярита, без повтора lead. \
-Если есть практическое следствие (что изменится, для кого, когда), назови его. \
-Не выдумывай того, чего нет в статье.
+meaning — ответ на вопрос «Что это значит?», до 380 символов. Длину выбирай по сложности: \
+простая новость (вышла игра, кто-то выиграл матч) — одно предложение; сложная (политика, \
+экономика, война, наука, медицина) — до четырёх. Объясни, что эта новость меняет и почему она важна, \
+так, будто рассказываешь другу, который совсем не разбирается в теме: без терминов и канцелярита, \
+без повтора lead. Если нужен контекст (почему это случилось, что было до этого), дай его коротко. \
+Если есть практическое следствие (что изменится, для кого, когда), назови его.
+next — что будет дальше: ближайший шаг, решение или дата, если они есть в статье, до 120 символов. \
+Например: «Голосование — 3 ноября, первые результаты утром 4-го по Москве». \
+Если в статье этого нет — пустая строка; не гадай.
+Везде: если факт известен только со слов одной стороны (правительства, армии, компании, \
+полиции) или не подтверждён, так и пиши: «по данным…», «как заявил…», «по неподтверждённым данным». \
+Не выдавай заявления за установленные факты. Не выдумывай того, чего нет в статье.
 
 """
 
@@ -818,8 +838,9 @@ DIGEST_SCHEMA = {
         "lead": {"type": "STRING"},
         "points": {"type": "ARRAY", "items": {"type": "STRING"}},
         "meaning": {"type": "STRING"},
+        "next": {"type": "STRING"},
     },
-    "required": ["title", "lead", "points", "meaning"],
+    "required": ["title", "lead", "points", "meaning", "next"],
 }
 
 
@@ -852,19 +873,21 @@ def digest(item, summary, paragraphs):
                 break
             title, lead = str(data.get("title", "")).strip(), str(data.get("lead", "")).strip()
             meaning = str(data.get("meaning", "")).strip()
+            nxt = str(data.get("next", "")).strip()
             points = [str(p).strip() for p in data.get("points", []) if str(p).strip()][:2]
-            text = " ".join([title, lead, meaning, *points])
+            text = " ".join([title, lead, meaning, nxt, *points])
             if not title or not lead or (TRANSLATE_TO == "ru" and not is_russian(text, share=0.3)):
                 print("[!] выжимка вернулась не того формата")
                 continue
             if attempt == 0 and garbled(text):
                 print("[!] в выжимке слова со смешанными буквами — прошу переписать")
                 continue
-            return {"title": title, "lead": lead, "points": points, "meaning": meaning, "paragraphs": full}
+            return {"title": title, "lead": lead, "points": points, "meaning": meaning, "next": nxt,
+                    "paragraphs": full}
     # Запасной вариант: обычный перевод, суть — первые предложения описания
     translated = translate([item["title"], summary], item["lang"])
     return {"title": translated[0], "lead": first_sentences(translated[1]), "points": [],
-            "meaning": "", "paragraphs": full}
+            "meaning": "", "next": "", "paragraphs": full}
 
 
 # ---------- Telegraph (полный текст внутри Telegram) ----------
@@ -945,31 +968,42 @@ def take_chars(paragraphs, limit):
     return out
 
 
-def build_post(category, post, sources, limit):
-    """Короткий пост: заголовок, пересказ, факты, «Что это значит?», источники и рубрика."""
-    head = f"{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
+def build_post(category, post, sources, limit, urgent=False):
+    """Короткий пост: заголовок, пересказ, факты, «Что это значит?», «Что дальше», источники и рубрика."""
+    mark = "⚡️ " if urgent else ""
+    head = f"{mark}{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
     names = " · ".join(sources[:4])
     tail = f"\n\n<i>{html.escape(names)}</i>  #{category['tag']}"
     lead, points, meaning = post["lead"], list(post["points"]), post.get("meaning", "")
+    nxt = post.get("next", "")
     while True:
         body = html.escape(lead)
         if points:
             body += "\n\n" + "\n".join(f"▪️ {html.escape(p)}" for p in points)
         if meaning:
             body += f"\n\n❓ <b>Что это значит?</b>\n{html.escape(meaning)}"
+        if nxt:
+            body += f"\n\n⏭ <b>Что дальше:</b> {html.escape(nxt)}"
         if len(head) + len(body) + len(tail) <= limit:
             return head + body + tail
-        # Сначала убираем факты, потом сокращаем объяснение и пересказ
+        # Сначала убираем факты, потом сокращаем объяснение и пересказ, в конце — «Что дальше»
         if points:
             points.pop()
         elif len(meaning) > 160:
             meaning = shorten(meaning, len(meaning) - 40)
         elif len(lead) > 120:
             lead = shorten(lead, len(lead) - 40)
+        elif nxt:
+            nxt = ""
         elif meaning:
             meaning = ""
         else:
             return head + body + tail
+
+
+def sound(urgent):
+    """Срочное приходит со звуком, остальное — тихо: подписчики не устают от уведомлений."""
+    return {} if urgent or not SILENT_POSTS else {"disable_notification": "true"}
 
 
 def keyboard(page, sources):
@@ -1025,7 +1059,7 @@ def download_video(url):
     return bytes(data) or None
 
 
-def send_video_post(category, post, names, markup, videos):
+def send_video_post(category, post, names, markup, videos, urgent=False):
     """Пост с видео в шапке вместо картинки. None — ни одно видео не подошло."""
     for video in videos:
         try:
@@ -1036,10 +1070,10 @@ def send_video_post(category, post, names, markup, videos):
                 # Ролик загружаем сами: в шапке он играет прямо в Telegram
                 return tg("sendVideo", files={"video": ("video.mp4", data, "video/mp4")},
                           supports_streaming="true", parse_mode="HTML", reply_markup=markup,
-                          caption=build_post(category, post, names, 1024))
+                          caption=build_post(category, post, names, 1024, urgent), **sound(urgent))
             # YouTube и Vimeo: Telegram сам ставит плеер над текстом, ролик смотрится не выходя из канала
             return tg("sendMessage", parse_mode="HTML", reply_markup=markup,
-                      text=build_post(category, post, names, 1500),
+                      text=build_post(category, post, names, 1500, urgent), **sound(urgent),
                       link_preview_options=json.dumps({"url": video["url"], "prefer_large_media": True,
                                                        "show_above_text": True}))
         except Exception as exc:
@@ -1049,11 +1083,11 @@ def send_video_post(category, post, names, markup, videos):
     return None
 
 
-def send_post(category, post, sources, image, markup, videos=()):
+def send_post(category, post, sources, image, markup, videos=(), urgent=False):
     """Публикует пост и возвращает сообщение Telegram."""
     names = [name for name, _ in sources]
     if VIDEO_HEADER and videos:
-        message = send_video_post(category, post, names, markup, videos)
+        message = send_video_post(category, post, names, markup, videos, urgent)
         if message:
             return message
     if image:
@@ -1061,13 +1095,14 @@ def send_post(category, post, sources, image, markup, videos=()):
         try:
             # Сверху — только картинка; файл загружаем сами, без пережатия чужим сервером
             return tg("sendPhoto", files={"photo": ("photo." + kind.split("/")[1], data, kind)},
-                      parse_mode="HTML", reply_markup=markup, caption=build_post(category, post, names, 1024))
+                      parse_mode="HTML", reply_markup=markup, **sound(urgent),
+                      caption=build_post(category, post, names, 1024, urgent))
         except Exception as exc:
             if any(s in str(exc) for s in FATAL_TG_ERRORS):
                 raise
             print(f"[!] не удалось отправить с фото, отправляю текстом: {exc}")
-    return tg("sendMessage", parse_mode="HTML", reply_markup=markup,
-              text=build_post(category, post, names, 1500),
+    return tg("sendMessage", parse_mode="HTML", reply_markup=markup, **sound(urgent),
+              text=build_post(category, post, names, 1500, urgent),
               link_preview_options=json.dumps({"is_disabled": True}))
 
 
@@ -1083,13 +1118,18 @@ def post_link(message):
     return None
 
 
-def publish(category, story):
-    """Публикует сюжет. Возвращает заголовок и ссылку для вечернего дайджеста."""
+def story_sources(story):
     item = story["main"]
     sources = {item["source"]: item["link"]}
     for member in story["members"]:
         sources.setdefault(member["source"], member["link"])
-    sources = list(sources.items())
+    return list(sources.items())
+
+
+def publish(category, story, urgent=False):
+    """Публикует сюжет. Возвращает заголовок и ссылку для вечернего дайджеста и номер поста."""
+    item = story["main"]
+    sources = story_sources(story)
 
     article = fetch_article(item["link"])
     paragraphs = article.get("paragraphs", [])
@@ -1110,8 +1150,80 @@ def publish(category, story):
     page = None
     if len(post["paragraphs"]) >= 3:
         page = telegraph_page(post["title"], post["paragraphs"], image[0] if image else None, item, videos)
-    message = send_post(category, post, sources, image, keyboard(page, sources), videos)
-    return {"title": post["title"], "url": page or post_link(message) or item["link"]}
+    message = send_post(category, post, sources, image, keyboard(page, sources), videos, urgent)
+    return {"title": post["title"], "url": page or post_link(message) or item["link"],
+            "msg": message.get("message_id") if isinstance(message, dict) else None}
+
+
+# ---------- обновления: новые факты о вышедшем сюжете ----------
+
+UPDATE_PROMPT = """Ты — выпускающий редактор новостного Telegram-канала. Канал уже опубликовал \
+новость (published). Пришла новая статья о том же сюжете (new).
+Реши, есть ли в новой статье существенный новый факт — развитие событий, о котором читателю \
+стоит узнать: принято решение, известен итог, изменилось число жертв или сумма, \
+пришло официальное подтверждение или опровержение, в историю вступила новая сторона, \
+то, что было обещано, произошло.
+Не новый факт: пересказ того же, обзор, анализ, мнения, реакция без последствий, те же цифры.
+Ответь JSON:
+new_fact — true или false;
+update — если true: обновление на русском, 1–2 коротких предложения, до 250 символов, \
+сразу с нового факта, без повтора того, что уже было в published. Грамотно, без опечаток. \
+Если факт известен со слов одной стороны или не подтверждён, так и пиши: «по данным…», «как заявил…». \
+Если false — пустая строка.
+
+"""
+
+UPDATE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"new_fact": {"type": "BOOLEAN"}, "update": {"type": "STRING"}},
+    "required": ["new_fact", "update"],
+}
+
+
+def maybe_update(state, category, story, old, urgent=False):
+    """Если в сюжете, который уже был в канале, появились новые факты, — публикует
+    «🔄 Обновление» ответом на старый пост. True — обновление вышло."""
+    root = old.get("msg")
+    if not UPDATES or not root or not GEMINI_API_KEY:
+        return False
+    now = time.time()
+    thread = state["threads"].get(str(root), {"count": 0, "ts": 0})
+    if thread["count"] >= UPDATE_MAX or now - thread["ts"] < UPDATE_GAP_MIN * 60:
+        return False
+    item = story["main"]
+    paragraphs = item["rss_paragraphs"] or fetch_article(item["link"]).get("paragraphs", [])
+    data = {"published": old["title"],
+            "new": {"title": item["title"], "summary": item["summary"],
+                    "text": "\n".join(take_chars(paragraphs, 4000))}}
+    try:
+        answer = gemini_text(UPDATE_PROMPT + json.dumps(data, ensure_ascii=False), UPDATE_SCHEMA)
+    except Exception as exc:
+        print(f"[!] не удалось проверить, есть ли новые факты: {exc}")
+        return False
+    text = str(answer.get("update", "")).strip()
+    if not answer.get("new_fact") or not text:
+        return False
+    if (TRANSLATE_TO == "ru" and not is_russian(text, share=0.3)) or garbled(text):
+        print("[!] обновление вернулось с ошибками, не публикую")
+        return False
+    sources = story_sources(story)
+    names = " · ".join(name for name, _ in sources[:4])
+    mark = "⚡️ " if urgent else ""
+    body = (f"{mark}🔄 <b>Обновление</b>\n\n{html.escape(shorten(text, 400))}\n\n"
+            f"<i>{html.escape(names)}</i>  #{category['tag']}")
+    try:
+        # Ответом на исходный пост: сюжет развивается в одной ветке. Если тот пост удалён — не публикуем
+        tg("sendMessage", parse_mode="HTML", text=body, reply_markup=keyboard(None, sources),
+           link_preview_options=json.dumps({"is_disabled": True}), **sound(urgent),
+           reply_parameters=json.dumps({"message_id": root, "allow_sending_without_reply": False}))
+    except Exception as exc:
+        if any(s in str(exc) for s in FATAL_TG_ERRORS):
+            problem("telegram", f"Telegram не даёт публиковать в канал: {exc}. Проверьте права бота.")
+        else:
+            print(f"[!] обновление не отправлено: {exc}")
+        return False
+    state["threads"][str(root)] = {"count": thread["count"] + 1, "ts": now}
+    return True
 
 
 def as_story(pooled):
@@ -1173,6 +1285,53 @@ def pin_digest(state, message_id):
         except Exception as exc:
             print(f"[!] не удалось открепить прошлый дайджест: {exc}")
     state["digest_pinned"] = message_id
+
+
+# ---------- навигация по каналу ----------
+
+def navigation_text():
+    lines = [f"🧭 <b>Навигация {html.escape(CHANNEL_NAME)}</b>",
+             "<i>Нажмите на хэштег, чтобы увидеть новости только этой рубрики</i>", ""]
+    lines += [f"{c['emoji']} #{c['tag']} — {html.escape(c['title'])}" for c in CATEGORIES]
+    if DIGEST_HOUR >= 0:
+        lines += ["", f"🗞 #дайджест — главное за день, каждый вечер в {DIGEST_HOUR}:00 по Москве"]
+    lines += ["", "<b>Значки в постах</b>",
+              "⚡️ — срочная новость, приходит со звуком",
+              "🔄 — обновление сюжета: ответ на прошлый пост о нём",
+              "❓ — что эта новость значит, простыми словами",
+              "⏭ — что будет дальше",
+              "📖 — полный перевод статьи прямо в Telegram"]
+    return "\n".join(lines)
+
+
+def ensure_navigation(state):
+    """Публикует и закрепляет навигацию. Если рубрики изменились — заменяет старую."""
+    if not NAVIGATION:
+        return
+    text = navigation_text()
+    sign = hashlib.sha1(text.encode()).hexdigest()[:12]
+    if state.get("nav_sign") == sign:
+        return
+    try:
+        message = tg("sendMessage", parse_mode="HTML", text=text, disable_notification="true",
+                     link_preview_options=json.dumps({"is_disabled": True}))
+    except Exception as exc:
+        problem("nav", f"Не удалось опубликовать навигацию: {exc}")
+        return
+    # Запоминаем сразу: даже если закрепить не вышло, навигация не будет публиковаться каждый запуск
+    old, state["nav_msg"], state["nav_sign"] = state.get("nav_msg"), message["message_id"], sign
+    try:
+        tg("pinChatMessage", message_id=message["message_id"], disable_notification="true")
+    except Exception as exc:
+        problem("pin", f"Не удалось закрепить навигацию: {exc}. Дайте боту в канале право "
+                       f"изменять чужие публикации: без него Telegram не разрешает закреплять.")
+    if old:
+        for method in ("unpinChatMessage", "deleteMessage"):
+            try:
+                tg(method, message_id=old)
+            except Exception as exc:
+                print(f"[!] старая навигация: {method}: {exc}")
+    print("Навигация опубликована и закреплена")
 
 
 def maybe_digest(state, force=False):
@@ -1245,15 +1404,22 @@ def run(only=None):
             break
         story = as_story(pooled)
         category = CATEGORY_BY_KEY[pooled["category"]]
+        urgent = story_score(pooled, now) >= URGENT_SCORE
         repeat = is_repeat(pooled, state["recent"])
         if repeat:
-            # Тот же сюжет уже был в канале — выбрасываем и запоминаем, чтобы ловить следующие пересказы
-            print(f"[повтор] {story['main']['source']}: {story['main']['title']}  ≈  {repeat}")
+            # Тот же сюжет уже был в канале. Есть новые факты — короткое обновление ответом на тот пост,
+            # нет — выбрасываем. Запоминаем в обоих случаях, чтобы ловить следующие пересказы
+            print(f"[повтор] {story['main']['source']}: {story['main']['title']}  ≈  {repeat['title']}")
             state["pool"].remove(pooled)
-            remember(state, seen, story["members"])
+            updated = maybe_update(state, category, story, repeat, urgent)
+            remember(state, seen, story["members"], repeat.get("msg"))
+            if updated:
+                state["last_post"] = time.time()
+                print(f"[{category['key']}] опубликовано обновление к посту {repeat['msg']}")
+                break
             continue
         try:
-            info = publish(category, story)
+            info = publish(category, story, urgent)
         except TranslationError as exc:
             # Переводчик недоступен — новость остаётся в очереди до следующего запуска
             problem("translate", f"Не получается перевести новости, посты отложены: {exc}")
@@ -1269,18 +1435,20 @@ def run(only=None):
                 mark_seen(state, seen, member)
             continue
         state["pool"].remove(pooled)
-        remember(state, seen, story["members"])
+        msg = info.pop("msg", None)
+        remember(state, seen, story["members"], msg)
         state["last_post"] = time.time()
         state["digest"].append({"ts": time.time(), "category": category["key"], **info})
         extra = f" (+{len(story['members']) - 1} похожих)" if len(story["members"]) > 1 else ""
-        print(f"[{category['key']}] опубликовано ({story_score(pooled, now):.1f} баллов): "
-              f"{story['main']['title']}{extra}")
+        print(f"[{category['key']}] опубликовано{' ⚡️ срочно' if urgent else ''} "
+              f"({story_score(pooled, now):.1f} баллов): {story['main']['title']}{extra}")
         break
 
     quiet = (time.time() - state["last_post"]) / 3600
     if quiet >= QUIET_HOURS:
         problem("quiet", f"Уже {quiet:.0f} ч в канале нет ни одного поста. Если это не тихая ночь, "
                          f"загляните в журнал запусков на GitHub.")
+    ensure_navigation(state)
     maybe_digest(state)
     send_alerts(state)
     save_state(state)
