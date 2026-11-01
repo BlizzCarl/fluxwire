@@ -66,7 +66,12 @@ MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "30000"))  # картинка
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "12"))  # старее — не берём в очередь
 POOL_HOURS = int(os.getenv("POOL_HOURS", "14"))  # сколько сюжет ждёт в очереди, потом выбрасывается
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»: столько ждём перепечаток и топов
-MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # минимальная оценка для публикации
+MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # порог для рубрик, которых нет в CATEGORY_MIN_SCORE
+# Порог публикации по рубрикам. Важность Gemini ставит по одной шкале для всех, а перепечатки
+# (+2 балла за каждое издание) в политике бывают почти всегда, в науке и играх — редко.
+# Поэтому мировой новости нужно больше баллов, а нишевой — меньше. Поменять одну рубрику
+# без правки кода: MIN_SCORE_GAMES: "6.5" и т. п. в news.yml
+CATEGORY_MIN_SCORE = {"world": 9, "tech": 8, "ai": 8, "science": 7, "games": 7, "movies": 7, "sport": 7}
 BREAKING_SCORE = float(os.getenv("BREAKING_SCORE", "13"))  # с такой оценкой — сразу, без ожидания
 URGENT_SCORE = float(os.getenv("URGENT_SCORE", "11"))  # с такой оценкой — пометка ⚡️ и звук уведомления
 SILENT_POSTS = os.getenv("SILENT_POSTS", "1") == "1"  # обычные посты приходят подписчикам без звука
@@ -548,13 +553,19 @@ def story_score(story, now):
             - max(0.0, age_hours - 6) / 3)
 
 
+def min_score(key):
+    """Порог публикации для рубрики: из news.yml (MIN_SCORE_<РУБРИКА>) или CATEGORY_MIN_SCORE."""
+    value = os.getenv(f"MIN_SCORE_{key.upper()}", "").strip()
+    return float(value) if value else CATEGORY_MIN_SCORE.get(key, MIN_SCORE)
+
+
 def eligible(story, now):
     rated = story["importance"] is not None or story.get("rate_tries", 0) >= 3 or not GEMINI_API_KEY
     if not rated:
         return False
     score = story_score(story, now)
     matured = now - story_start(story) >= HOLD_MINUTES * 60
-    return score >= MIN_SCORE and (matured or score >= BREAKING_SCORE)
+    return score >= min_score(story["category"]) and (matured or score >= BREAKING_SCORE)
 
 
 # ---------- очередь «созревания» ----------
@@ -621,7 +632,8 @@ def show_top(pool, now, limit=8):
         sources = len({m["source"] for m in story["members"]})
         mark = "✅" if eligible(story, now) else "⏳"
         age = (now - story_start(story)) / 3600
-        print(f"  {mark} {story_score(story, now):5.1f}  важность {story['importance']}  "
+        print(f"  {mark} {story_score(story, now):5.1f}/{min_score(story['category']):g}  "
+              f"важность {story['importance']}  "
               f"изданий {sources}  {story['signals'] or ''}  {age:.1f} ч  "
               f"[{story['category']}] {story['members'][0]['title']}")
 
