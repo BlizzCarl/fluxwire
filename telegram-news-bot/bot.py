@@ -66,12 +66,20 @@ MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "30000"))  # картинка
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "12"))  # старее — не берём в очередь
 POOL_HOURS = int(os.getenv("POOL_HOURS", "14"))  # сколько сюжет ждёт в очереди, потом выбрасывается
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»: столько ждём перепечаток и топов
-MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # порог для рубрик, которых нет в CATEGORY_MIN_SCORE
-# Порог публикации по рубрикам. Важность Gemini ставит по одной шкале для всех, а перепечатки
-# (+2 балла за каждое издание) в политике бывают почти всегда, в науке и играх — редко.
-# Поэтому мировой новости нужно больше баллов, а нишевой — меньше. Поменять одну рубрику
-# без правки кода: MIN_SCORE_GAMES: "6.5" и т. п. в news.yml
-CATEGORY_MIN_SCORE = {"world": 9, "tech": 8, "ai": 8, "science": 7, "games": 7, "movies": 7, "sport": 7}
+MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # порог для рубрик, о которых ещё нет данных
+# Порог публикации считается для каждой рубрики сам, по её собственной истории: проходит
+# доля AUTO_SHARE лучших сюжетов рубрики за AUTO_DAYS дней. В политике перепечаток много и
+# баллы выше — порог у неё выше; в играх и науке ниже. Так у каждой рубрики равные шансы:
+# сильная игровая новость соревнуется с сильной политической, а не со средней.
+AUTO_SHARE = float(os.getenv("AUTO_SHARE", "0.12"))  # какая доля лучших сюжетов рубрики проходит
+AUTO_DAYS = float(os.getenv("AUTO_DAYS", "3"))  # за сколько дней считать
+AUTO_MIN_STORIES = int(os.getenv("AUTO_MIN_STORIES", "30"))  # меньше сюжетов — стартовый порог ниже
+AUTO_FLOOR = float(os.getenv("AUTO_FLOOR", "6"))  # ниже этого порог не опускается: мелочь не пройдёт
+AUTO_CEIL = float(os.getenv("AUTO_CEIL", "12"))  # выше не поднимается
+# Стартовые пороги, пока у рубрики не накопилось AUTO_MIN_STORIES сюжетов (обычно первые сутки).
+# Поменять одну рубрику вручную, без автоподбора: MIN_SCORE_GAMES: "6.5" и т. п. в news.yml
+CATEGORY_MIN_SCORE = {"world": 9, "tech": 8, "ai": 8, "science": 8, "games": 8, "movies": 8, "sport": 8}
+RATING_V = 2  # версия шкалы оценок: при смене старые оценки пересчитываются
 BREAKING_SCORE = float(os.getenv("BREAKING_SCORE", "13"))  # с такой оценкой — сразу, без ожидания
 URGENT_SCORE = float(os.getenv("URGENT_SCORE", "11"))  # с такой оценкой — пометка ⚡️ и звук уведомления
 SILENT_POSTS = os.getenv("SILENT_POSTS", "1") == "1"  # обычные посты приходят подписчикам без звука
@@ -114,10 +122,18 @@ def load_state():
     state.setdefault("alerts", {})   # когда о какой поломке уже писали
     state.setdefault("feed_fails", {})
     state.setdefault("threads", {})  # сколько обновлений вышло к каждому посту
+    state.setdefault("history", {})  # лучшие баллы ушедших из очереди сюжетов, по рубрикам
     state.setdefault("last_post", time.time())
     state.setdefault("next_category", 0)
     # Сюжеты из удалённых рубрик (например, «Бизнес») больше не публикуем
     state["pool"] = [s for s in state["pool"] if s["category"] in CATEGORY_BY_KEY]
+    # Оценки по старой шкале (одна мировая) — заново, по двум шкалам; история баллов — с нуля
+    for story in state["pool"]:
+        if story.get("rating_v") != RATING_V:
+            story.update(importance=None, world=None, rate_tries=0, rating_v=RATING_V)
+            story.pop("peak", None)
+    if state.get("rating_v") != RATING_V:
+        state["history"], state["rating_v"] = {}, RATING_V
     return state
 
 
@@ -125,6 +141,8 @@ def save_state(state):
     border = time.time() - DEDUP_HOURS * 3600
     state["recent"] = [r for r in state["recent"] if r["ts"] > border][-2000:]
     state["threads"] = {k: v for k, v in state["threads"].items() if v["ts"] > border}
+    since = time.time() - AUTO_DAYS * 86400
+    state["history"] = {k: [h for h in v if h[0] > since][-1500:] for k, v in state["history"].items()}
     state["posted"] = state["posted"][-8000:]
     state["digest"] = [d for d in state["digest"] if d["ts"] > time.time() - 36 * 3600][-300:]
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -470,23 +488,38 @@ def garbled(text):
 
 RATE_PROMPT = """Ты — выпускающий редактор международного новостного Telegram-канала \
 (политика и мир, наука и медицина, технологии, искусственный интеллект, игры, кино и сериалы, \
-спорт: футбол, бокс, теннис).
-Оцени каждую новость по шкале от 1 до 10: насколько она важна и интересна широкой аудитории.
-10 — событие мирового масштаба, о котором говорят все.
-8–9 — крупная новость, которую обсуждают во всём мире или во всей отрасли: громкий анонс \
-или релиз, новая нейросеть от крупной компании, прорыв в лечении болезни, важное открытие, \
-крупный трансфер, титульный бой, финал турнира.
-5–7 — заметная новость своей отрасли.
-3–4 — рядовая заметка, в том числе отчёты компаний и движение акций.
-1–2 — проходное: обзоры, подборки, гайды, скидки, слухи без источника, колонки мнений, \
-реклама, мелкие локальные новости, исследования на мышах без практического значения.
-Ответь JSON-массивом целых чисел той же длины и в том же порядке, что и список.
+спорт: футбол, бокс, теннис). Для каждой новости поставь две оценки от 1 до 10.
+
+topic — важность по меркам её рубрики: насколько это важно тем, кто следит за этой темой. \
+Каждую рубрику оценивай по её собственной шкале, не сравнивая с другими рубриками:
+- Политика и мир: 10 — начало войны, смена власти в крупной стране; 5 — рядовое заявление политика.
+- Наука и медицина: 10 — прорыв уровня новой вакцины или нобелевского открытия; 5 — рядовое исследование.
+- Технологии: 10 — новый iPhone, крупнейшая сделка, сбой мирового масштаба; 5 — обновление приложения.
+- Искусственный интеллект: 10 — новая флагманская модель OpenAI, Google или Anthropic; 5 — мелкая функция.
+- Игры: 10 — анонс или перенос GTA, новая консоль, закрытие крупной студии; 5 — рядовой патч или трейлер.
+- Кино и сериалы: 10 — «Оскар», кассовый рекорд, анонс крупной франшизы; 5 — рядовой кастинг.
+- Спорт: 10 — финал Лиги чемпионов или чемпионата мира, титульный бой, победа на турнире \
+Большого шлема; 5 — рядовой матч.
+
+world — важность для широкой аудитории, одна шкала для всех рубрик: 10 — событие мирового \
+масштаба, о котором говорят все; новости игр, кино и спорта редко выше 7.
+
+В обеих оценках 1–2 — проходное: обзоры, подборки, гайды, скидки, слухи без источника, \
+колонки мнений, реклама, мелкие локальные новости, исследования на мышах без практического значения.
+Ответь JSON-массивом объектов {"topic": число, "world": число} той же длины и в том же порядке, \
+что и список.
 
 """
 
+RATE_SCHEMA = {"type": "ARRAY", "items": {
+    "type": "OBJECT",
+    "properties": {"topic": {"type": "INTEGER"}, "world": {"type": "INTEGER"}},
+    "required": ["topic", "world"],
+}}
+
 
 def rate_stories(pool):
-    """Gemini оценивает важность новых сюжетов, пачками по 60."""
+    """Gemini оценивает новые сюжеты пачками по 60: важность в рубрике и для всех."""
     if not GEMINI_API_KEY:
         return
     todo = [s for s in pool if s["importance"] is None and s.get("rate_tries", 0) < 3][:180]
@@ -497,11 +530,12 @@ def rate_stories(pool):
             m = story["members"][0]
             lines.append(f"{n}. [{CATEGORY_BY_KEY[story['category']]['title']}] {m['title']} — {m['summary'][:200]}")
         try:
-            scores = gemini(RATE_PROMPT + "\n".join(lines), {"type": "ARRAY", "items": {"type": "INTEGER"}})
+            scores = gemini(RATE_PROMPT + "\n".join(lines), RATE_SCHEMA)
             if not isinstance(scores, list) or len(scores) != len(batch):
                 raise TranslationError("ответ не той длины")
             for story, value in zip(batch, scores):
-                story["importance"] = max(1, min(10, int(value)))
+                story["importance"] = max(1, min(10, int(value["topic"])))
+                story["world"] = max(1, min(10, int(value["world"])))
         except Exception as exc:
             problem("rate", f"Gemini не смог оценить важность новостей: {exc}. "
                             f"Пока это так, бот публикует почти без отбора.")
@@ -553,10 +587,58 @@ def story_score(story, now):
             - max(0.0, age_hours - 6) / 3)
 
 
+def world_score(story, now):
+    """Тот же балл, но с мировой важностью вместо важности в рубрике: по нему решается,
+    срочно ли это для всех (⚡️, звук, публикация без ожидания)."""
+    if story.get("world") is None or story["importance"] is None:
+        return story_score(story, now)
+    return story_score(story, now) - story["importance"] + story["world"]
+
+
+THRESHOLDS = {}  # порог каждой рубрики на этот запуск: ключ → (порог, по скольким сюжетам)
+
+
+def track_peaks(pool, now):
+    """Запоминает лучший балл каждого сюжета: со временем свежесть отнимает баллы."""
+    for story in pool:
+        if story["importance"] is not None:
+            story["peak"] = max(story.get("peak", 0), story_score(story, now))
+
+
+def retire(state, story):
+    """Сюжет ушёл из очереди (вышел, оказался повтором или устарел) — его лучший балл в историю рубрики."""
+    if story.get("importance") is None:
+        return
+    peak = story.get("peak") or story_score(story, time.time())
+    state["history"].setdefault(story["category"], []).append([round(time.time()), round(peak, 2)])
+
+
+def compute_thresholds(state):
+    """Порог рубрики — балл, который набирает доля AUTO_SHARE лучших её сюжетов за AUTO_DAYS дней."""
+    since = time.time() - AUTO_DAYS * 86400
+    THRESHOLDS.clear()
+    for category in CATEGORIES:
+        key = category["key"]
+        scores = sorted(s for ts, s in state["history"].get(key, []) if ts > since)
+        if len(scores) < AUTO_MIN_STORIES:
+            continue
+        value = scores[min(int(len(scores) * (1 - AUTO_SHARE)), len(scores) - 1)]
+        THRESHOLDS[key] = (round(min(AUTO_CEIL, max(AUTO_FLOOR, value)), 1), len(scores))
+    print("Пороги рубрик: " + ", ".join(
+        f"{c['key']} {min_score(c['key']):g}"
+        + (f" (по {THRESHOLDS[c['key']][1]} сюжетам)" if c["key"] in THRESHOLDS else " (стартовый)")
+        for c in CATEGORIES))
+
+
 def min_score(key):
-    """Порог публикации для рубрики: из news.yml (MIN_SCORE_<РУБРИКА>) или CATEGORY_MIN_SCORE."""
+    """Порог публикации для рубрики: ручной из news.yml (MIN_SCORE_<РУБРИКА>), иначе посчитанный
+    по истории рубрики, а пока данных мало — стартовый из CATEGORY_MIN_SCORE."""
     value = os.getenv(f"MIN_SCORE_{key.upper()}", "").strip()
-    return float(value) if value else CATEGORY_MIN_SCORE.get(key, MIN_SCORE)
+    if value:
+        return float(value)
+    if key in THRESHOLDS:
+        return THRESHOLDS[key][0]
+    return CATEGORY_MIN_SCORE.get(key, MIN_SCORE)
 
 
 def eligible(story, now):
@@ -565,7 +647,7 @@ def eligible(story, now):
         return False
     score = story_score(story, now)
     matured = now - story_start(story) >= HOLD_MINUTES * 60
-    return score >= min_score(story["category"]) and (matured or score >= BREAKING_SCORE)
+    return score >= min_score(story["category"]) and (matured or world_score(story, now) >= BREAKING_SCORE)
 
 
 # ---------- очередь «созревания» ----------
@@ -612,12 +694,14 @@ def update_pool(state, seen, cutoff):
     for group in (dedup.group_stories([i["text"] for i in new]) if new else []):
         members = [new[k] for k in group]
         pool.append({"category": members[0]["category"], "first_seen": now, "importance": None,
+                     "world": None, "rating_v": RATING_V,
                      "rate_tries": 0, "signals": {}, "members": [pack(m) for m in members]})
 
     # 4. Не «выстрелившее» за POOL_HOURS — выбрасываем
     keep = []
     for story in pool:
         if now - story_start(story) > POOL_HOURS * 3600:
+            retire(state, story)
             for member in story["members"]:
                 mark_seen(state, seen, member)
         else:
@@ -633,7 +717,7 @@ def show_top(pool, now, limit=8):
         mark = "✅" if eligible(story, now) else "⏳"
         age = (now - story_start(story)) / 3600
         print(f"  {mark} {story_score(story, now):5.1f}/{min_score(story['category']):g}  "
-              f"важность {story['importance']}  "
+              f"важность {story['importance']} (для всех {story.get('world')})  "
               f"изданий {sources}  {story['signals'] or ''}  {age:.1f} ч  "
               f"[{story['category']}] {story['members'][0]['title']}")
 
@@ -1418,6 +1502,8 @@ def prepare(state, seen):
     update_pool(state, seen, cutoff)
     rate_stories(state["pool"])
     apply_signals(state["pool"])
+    track_peaks(state["pool"], time.time())
+    compute_thresholds(state)
 
 
 def run(only=None):
@@ -1448,13 +1534,14 @@ def run(only=None):
             break
         story = as_story(pooled)
         category = CATEGORY_BY_KEY[pooled["category"]]
-        urgent = story_score(pooled, now) >= URGENT_SCORE
+        urgent = world_score(pooled, now) >= URGENT_SCORE
         repeat = is_repeat(pooled, state["recent"])
         if repeat:
             # Тот же сюжет уже был в канале. Есть новые факты — короткое обновление ответом на тот пост,
             # нет — выбрасываем. Запоминаем в обоих случаях, чтобы ловить следующие пересказы
             print(f"[повтор] {story['main']['source']}: {story['main']['title']}  ≈  {repeat['title']}")
             state["pool"].remove(pooled)
+            retire(state, pooled)
             updated = maybe_update(state, category, story, repeat, urgent)
             remember(state, seen, story["members"], repeat.get("msg"))
             if updated:
@@ -1475,10 +1562,12 @@ def run(only=None):
                 break
             print(f"[!] {story['main']['link']}: {exc}")
             state["pool"].remove(pooled)
+            retire(state, pooled)
             for member in story["members"]:
                 mark_seen(state, seen, member)
             continue
         state["pool"].remove(pooled)
+        retire(state, pooled)
         msg = info.pop("msg", None)
         remember(state, seen, story["members"], msg)
         state["last_post"] = time.time()
