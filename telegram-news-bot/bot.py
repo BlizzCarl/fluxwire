@@ -909,19 +909,17 @@ DIGEST_PROMPT = """Ты — редактор новостного Telegram-ка�
 title — понятный заголовок до 100 символов. Сразу ясно, о ком или о чём речь: \
 не «Альтман ответил критикам», а «Глава OpenAI Сэм Альтман ответил на обвинения в…». \
 Малоизвестных людей, компании, игры, команды поясняй парой слов. Без кликбейта и вопросов.
-lead — краткий пересказ: что случилось, в 2 коротких предложениях, до 280 символов. \
+lead — что случилось: 2–3 коротких предложения, до 350 символов, одним связным абзацем. \
+Самые важные цифры, сроки и имена вплети прямо в текст, без отдельных списков. \
 Без воды, вводных слов и повтора заголовка.
-points — 0–2 ключевых факта (цифры, сроки), каждый до 90 символов. \
-Не повторяй lead. Если добавить нечего — пустой массив.
 meaning — ответ на вопрос «Что это значит?», до 380 символов. Длину выбирай по сложности: \
 простая новость (вышла игра, кто-то выиграл матч) — одно предложение; сложная (политика, \
 экономика, война, наука, медицина) — до четырёх. Объясни, что эта новость меняет и почему она важна, \
 так, будто рассказываешь другу, который совсем не разбирается в теме: без терминов и канцелярита, \
 без повтора lead. Если нужен контекст (почему это случилось, что было до этого), дай его коротко. \
-Если есть практическое следствие (что изменится, для кого, когда), назови его.
-next — что будет дальше: ближайший шаг, решение или дата, если они есть в статье, до 120 символов. \
-Например: «Голосование — 3 ноября, первые результаты утром 4-го по Москве». \
-Если в статье этого нет — пустая строка; не гадай.
+Если есть практическое следствие (что изменится, для кого, когда), назови его. \
+Если в статье есть следующий шаг или дата (голосование, релиз, матч, решение суда), \
+закончи объяснение им одной короткой фразой. Если нет — не гадай.
 Везде: если факт известен только со слов одной стороны (правительства, армии, компании, \
 полиции) или не подтверждён, так и пиши: «по данным…», «как заявил…», «по неподтверждённым данным». \
 Не выдавай заявления за установленные факты. Не выдумывай того, чего нет в статье.
@@ -933,11 +931,9 @@ DIGEST_SCHEMA = {
     "properties": {
         "title": {"type": "STRING"},
         "lead": {"type": "STRING"},
-        "points": {"type": "ARRAY", "items": {"type": "STRING"}},
         "meaning": {"type": "STRING"},
-        "next": {"type": "STRING"},
     },
-    "required": ["title", "lead", "points", "meaning", "next"],
+    "required": ["title", "lead", "meaning"],
 }
 
 
@@ -970,21 +966,18 @@ def digest(item, summary, paragraphs):
                 break
             title, lead = str(data.get("title", "")).strip(), str(data.get("lead", "")).strip()
             meaning = str(data.get("meaning", "")).strip()
-            nxt = str(data.get("next", "")).strip()
-            points = [str(p).strip() for p in data.get("points", []) if str(p).strip()][:2]
-            text = " ".join([title, lead, meaning, nxt, *points])
+            text = " ".join([title, lead, meaning])
             if not title or not lead or (TRANSLATE_TO == "ru" and not is_russian(text, share=0.3)):
                 print("[!] выжимка вернулась не того формата")
                 continue
             if attempt == 0 and garbled(text):
                 print("[!] в выжимке слова со смешанными буквами — прошу переписать")
                 continue
-            return {"title": title, "lead": lead, "points": points, "meaning": meaning, "next": nxt,
-                    "paragraphs": full}
+            return {"title": title, "lead": lead, "meaning": meaning, "paragraphs": full}
     # Запасной вариант: обычный перевод, суть — первые предложения описания
     translated = translate([item["title"], summary], item["lang"])
-    return {"title": translated[0], "lead": first_sentences(translated[1]), "points": [],
-            "meaning": "", "next": "", "paragraphs": full}
+    return {"title": translated[0], "lead": first_sentences(translated[1]), "meaning": "",
+            "paragraphs": full}
 
 
 # ---------- Telegraph (полный текст внутри Telegram) ----------
@@ -1066,32 +1059,23 @@ def take_chars(paragraphs, limit):
 
 
 def build_post(category, post, sources, limit, urgent=False):
-    """Короткий пост: заголовок, пересказ, факты, «Что это значит?», «Что дальше», источники и рубрика."""
+    """Короткий пост: заголовок, что случилось, «Что это значит?», источники и рубрика."""
     mark = "⚡️ " if urgent else ""
     head = f"{mark}{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
     names = " · ".join(sources[:4])
     tail = f"\n\n<i>{html.escape(names)}</i>  {hashtag(category['tag'])}"
-    lead, points, meaning = post["lead"], list(post["points"]), post.get("meaning", "")
-    nxt = post.get("next", "")
+    lead, meaning = post["lead"], post.get("meaning", "")
     while True:
         body = html.escape(lead)
-        if points:
-            body += "\n\n" + "\n".join(f"▪️ {html.escape(p)}" for p in points)
         if meaning:
             body += f"\n\n❓ <b>Что это значит?</b>\n{html.escape(meaning)}"
-        if nxt:
-            body += f"\n\n⏭ <b>Что дальше:</b> {html.escape(nxt)}"
         if len(head) + len(body) + len(tail) <= limit:
             return head + body + tail
-        # Сначала убираем факты, потом сокращаем объяснение и пересказ, в конце — «Что дальше»
-        if points:
-            points.pop()
-        elif len(meaning) > 160:
+        # Сначала сокращаем объяснение, потом пересказ
+        if len(meaning) > 160:
             meaning = shorten(meaning, len(meaning) - 40)
         elif len(lead) > 120:
             lead = shorten(lead, len(lead) - 40)
-        elif nxt:
-            nxt = ""
         elif meaning:
             meaning = ""
         else:
@@ -1418,7 +1402,6 @@ def navigation_text():
               "⚡️ — срочная новость, приходит со звуком",
               "🔄 — обновление сюжета: ответ на прошлый пост о нём",
               "❓ — что эта новость значит, простыми словами",
-              "⏭ — что будет дальше",
               "📖 — полный перевод статьи прямо в Telegram"]
     return "\n".join(lines)
 
