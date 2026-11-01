@@ -1,9 +1,18 @@
 name: news
 
+# Бота каждые 10 минут запускает внешний будильник cron-job.org (см. README).
+# Своего расписания GitHub здесь нет специально: иначе бот запускался бы дважды.
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Что сделать"
+        type: choice
+        default: post
+        options:
+          - post        # обычный запуск: один пост (так запускает cron-job.org)
+          - digest      # опубликовать дайджест прямо сейчас, для проверки
+          - test-alert  # прислать пробное предупреждение в личку
 
 permissions:
   contents: read
@@ -45,15 +54,25 @@ jobs:
           path: telegram-news-bot/.cache/fastembed
           key: fastembed-paraphrase-multilingual-MiniLM-L12-v2
 
-      - run: python bot.py
+      - name: Run bot
+        run: |
+          case "$MODE" in
+            digest) python bot.py --digest ;;
+            test-alert) python bot.py --test-alert ;;
+            *) python bot.py ;;
+          esac
         env:
+          MODE: ${{ inputs.mode }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           TRANSLATE_TO: ru
           PYTHONUNBUFFERED: "1"
           MIN_SCORE: "8"
+          DIGEST_HOUR: "21"
+          DIGEST_TZ: Europe/Moscow
 
       - name: Save state
         if: always()
@@ -61,9 +80,3 @@ jobs:
         with:
           path: telegram-news-bot/state.json
           key: news-state-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Keep schedule alive
-        if: github.event_name == 'schedule'
-        run: gh api --method PUT "repos/${{ github.repository }}/actions/workflows/news.yml/enable"
-        env:
-          GH_TOKEN: ${{ github.token }}
