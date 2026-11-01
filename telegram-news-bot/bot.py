@@ -93,8 +93,8 @@ DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "21"))  # час вечернего �
 DIGEST_TZ = os.getenv("DIGEST_TZ", "Europe/Moscow").strip()  # часовой пояс дайджеста
 ALERT_HOURS = float(os.getenv("ALERT_HOURS", "6"))  # об одной и той же поломке — не чаще раза в N часов
 QUIET_HOURS = float(os.getenv("QUIET_HOURS", "8"))  # столько часов без постов — повод предупредить
-FEED_ALERT_RUNS = int(os.getenv("FEED_ALERT_RUNS", "18"))  # лента молчит столько запусков (~3 ч) — сказать
-INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "10"))
+FEED_ALERT_HOURS = float(os.getenv("FEED_ALERT_HOURS", "3"))  # лента молчит столько часов — сказать
+INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "15"))  # как часто запускается бот (cron-job.org — раз в 15 минут)
 STATE_FILE = Path(os.getenv("STATE_FILE", Path(__file__).with_name("state.json")))
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -369,12 +369,13 @@ def fetch_entries(categories):
 def track_feeds(state, failures):
     """Считает, сколько запусков подряд лента не отвечает, и предупреждает, если долго."""
     fails = state["feed_fails"]
+    limit = max(1, round(FEED_ALERT_HOURS * 60 / INTERVAL_MIN))
     for name in list(fails):
         if name not in failures:
             del fails[name]
     for name, error in failures.items():
         fails[name] = fails.get(name, 0) + 1
-        if fails[name] >= FEED_ALERT_RUNS:
+        if fails[name] >= limit:
             problem(f"feed:{name}", f"Лента «{name}» не отвечает уже {fails[name]} запусков подряд "
                                     f"(примерно {fails[name] * INTERVAL_MIN // 60} ч): {error}. "
                                     f"Если так и останется, её стоит заменить в feeds.py.")
@@ -1485,7 +1486,7 @@ def maybe_digest(state, force=False):
             first = first or message
     except Exception as exc:
         problem("digest", f"Не удалось опубликовать вечерний дайджест: {exc}. Бот попробует ещё раз "
-                          f"через 10 минут.")
+                          f"при следующем запуске.")
         return
     print(f"Дайджест опубликован: {len(items)} новостей")
     if first:
