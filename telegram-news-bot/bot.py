@@ -3,18 +3,22 @@
 
 Как выбирается новость:
   1. Все статьи попадают в очередь «созревания». Одинаковые сюжеты из разных изданий
-     склеиваются в один.
+     склеиваются в один. Статьи без даты публикации отбрасываются.
   2. Gemini оценивает важность каждого сюжета от 1 до 10, как выпускающий редактор.
   3. Каждый запуск бот проверяет популярность: сколько изданий подхватило сюжет, есть ли он
      в Google Trends, на главной Hacker News, в топах самых читаемых NYT и Guardian.
   4. Новость выходит, когда «созрела» (прошло HOLD_MINUTES с публикации) и набрала MIN_SCORE.
      Срочное (BREAKING_SCORE) выходит сразу. Не набравшее баллов за POOL_HOURS — выбрасывается.
   5. Рубрики идут по кругу; если в рубрике нет важного, берётся важное из следующей.
+  6. Раз в день в DIGEST_HOUR выходит дайджест: заголовки всех новостей с прошлого дайджеста.
+  7. Если что-то сломалось, бот пишет об этом в личку (ADMIN_CHAT_ID).
 
 Запуск:
     python bot.py                — один пост: для GitHub Actions / cron
     python bot.py games          — один пост только из этой категории (ключ из feeds.py)
     python bot.py --loop         — работать постоянно, пост раз в INTERVAL_MIN минут (сервер, Docker)
+    python bot.py --digest       — опубликовать дайджест прямо сейчас (проверка, вечерний не сбивает)
+    python bot.py --test-alert   — прислать пробное предупреждение в личку
     python bot.py --rank         — показать очередь с оценками, ничего не публикуя
     python bot.py --check-feeds  — проверить, какие RSS-ленты работают
     python bot.py --check-dupes  — показать, какие свежие новости бот считает одинаковыми
@@ -29,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import numpy as np
@@ -39,15 +43,21 @@ from bs4 import BeautifulSoup
 
 import dedup
 import popularity
-from feeds import CATEGORIES, SKIP_TITLE, SKIP_URL
+from feeds import CATEGORIES, SKIP_TEXT, SKIP_TITLE, SKIP_URL
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()  # ваш личный чат: сюда приходят предупреждения
 TRANSLATE_TO = os.getenv("TRANSLATE_TO", "ru").strip()  # пусто — не переводить
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # переводчик и редактор-нейросеть
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()  # оценка важности, повторы
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.8-flash").strip()  # текст поста и перевод
 FULL_TEXT = os.getenv("FULL_TEXT", "1") == "1"  # полный перевод статьи в Telegraph по кнопке
 MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "15000"))  # длиннее — в Telegraph идёт начало
+TRANSLATE_CHUNK = int(os.getenv("TRANSLATE_CHUNK", "7000"))  # статья переводится кусками: меньше ошибок
+MAX_VIDEOS = int(os.getenv("MAX_VIDEOS", "3"))  # сколько видео из статьи встраивать в Telegraph
+VIDEO_HEADER = os.getenv("VIDEO_HEADER", "1") == "1"  # видео из статьи — в шапку поста вместо картинки
+MAX_VIDEO_MB = int(os.getenv("MAX_VIDEO_MB", "45"))  # больше бот загрузить в Telegram не может (лимит 50 МБ)
 MIN_IMAGE_WIDTH = int(os.getenv("MIN_IMAGE_WIDTH", "600"))  # миниатюры уже этого из ленты не берём
 MIN_IMAGE_BYTES = int(os.getenv("MIN_IMAGE_BYTES", "30000"))  # картинка легче — скорее всего мутная
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "12"))  # старее — не берём в очередь
@@ -56,6 +66,11 @@ HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "90"))  # «созревание»:
 MIN_SCORE = float(os.getenv("MIN_SCORE", "9"))  # минимальная оценка для публикации
 BREAKING_SCORE = float(os.getenv("BREAKING_SCORE", "13"))  # с такой оценкой — сразу, без ожидания
 DEDUP_HOURS = int(os.getenv("DEDUP_HOURS", "48"))  # сколько помнить сюжеты для отсева дублей
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "21"))  # час вечернего дайджеста; -1 — выключить
+DIGEST_TZ = os.getenv("DIGEST_TZ", "Europe/Moscow").strip()  # часовой пояс дайджеста
+ALERT_HOURS = float(os.getenv("ALERT_HOURS", "6"))  # об одной и той же поломке — не чаще раза в N часов
+QUIET_HOURS = float(os.getenv("QUIET_HOURS", "8"))  # столько часов без постов — повод предупредить
+FEED_ALERT_RUNS = int(os.getenv("FEED_ALERT_RUNS", "18"))  # лента молчит столько запусков (~3 ч) — сказать
 INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "10"))
 STATE_FILE = Path(os.getenv("STATE_FILE", Path(__file__).with_name("state.json")))
 
@@ -69,6 +84,8 @@ EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 FATAL_TG_ERRORS = ("administrator rights", "chat not found", "Unauthorized", "bot was kicked",
                    "not enough rights")
 CATEGORY_BY_KEY = {c["key"]: c for c in CATEGORIES}
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+          "сентября", "октября", "ноября", "декабря"]
 
 
 # ---------- состояние (что уже опубликовано и что ждёт в очереди) ----------
@@ -78,7 +95,13 @@ def load_state():
     state.setdefault("posted", [])   # ключи ссылок, которые уже видели
     state.setdefault("recent", [])   # недавние опубликованные сюжеты для поиска дублей
     state.setdefault("pool", [])     # очередь «созревания»
+    state.setdefault("digest", [])   # опубликованное с прошлого дайджеста
+    state.setdefault("alerts", {})   # когда о какой поломке уже писали
+    state.setdefault("feed_fails", {})
+    state.setdefault("last_post", time.time())
     state.setdefault("next_category", 0)
+    # Сюжеты из удалённых рубрик (например, «Бизнес») больше не публикуем
+    state["pool"] = [s for s in state["pool"] if s["category"] in CATEGORY_BY_KEY]
     return state
 
 
@@ -86,6 +109,7 @@ def save_state(state):
     border = time.time() - DEDUP_HOURS * 3600
     state["recent"] = [r for r in state["recent"] if r["ts"] > border][-2000:]
     state["posted"] = state["posted"][-8000:]
+    state["digest"] = [d for d in state["digest"] if d["ts"] > time.time() - 36 * 3600][-300:]
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), "utf-8")
 
@@ -122,6 +146,50 @@ def unpack(data):
     item = dict(data)
     item["date"] = datetime.fromtimestamp(data["date"], timezone.utc) if data.get("date") else None
     return item
+
+
+# ---------- предупреждения в личку ----------
+
+PROBLEMS = {}  # что сломалось за этот запуск: ключ → текст
+
+
+def problem(key, text):
+    print(f"[!] {text}")
+    PROBLEMS.setdefault(key, text)
+
+
+def send_alerts(state):
+    """Отправляет в личку новые поломки. Об одной и той же — не чаще раза в ALERT_HOURS."""
+    found = dict(PROBLEMS)
+    PROBLEMS.clear()
+    if not found or not ADMIN_CHAT_ID or not BOT_TOKEN:
+        return
+    now = time.time()
+    sent = state.setdefault("alerts", {})
+    for key in [k for k, ts in sent.items() if now - ts > 7 * 24 * 3600]:
+        del sent[key]
+    fresh = [(k, t) for k, t in found.items() if now - sent.get(k, 0) >= ALERT_HOURS * 3600]
+    if not fresh:
+        return
+    text = "⚠️ <b>Новостной бот: нужна проверка</b>\n\n" + "\n\n".join(
+        f"• {html.escape(t)}" for _, t in fresh)
+    try:
+        tg("sendMessage", chat_id=ADMIN_CHAT_ID, parse_mode="HTML", text=text[:4000])
+        for key, _ in fresh:
+            sent[key] = now
+    except Exception as exc:
+        print(f"[!] не удалось отправить предупреждение в личку: {exc}\n"
+              f"    Напишите своему боту /start и проверьте ADMIN_CHAT_ID")
+
+
+def report_crash(exc):
+    problem("crash", f"Запуск упал с ошибкой: {exc}. Подробности — в журнале запуска на GitHub (Actions).")
+    try:
+        state = load_state()
+        send_alerts(state)
+        save_state(state)
+    except Exception as inner:
+        print(f"[!] не удалось сообщить о сбое: {inner}")
 
 
 # ---------- чтение источников ----------
@@ -172,24 +240,71 @@ def rss_paragraphs(entry):
     return [p for p in paragraphs if len(p) > 1]
 
 
+# ---------- видео из статей ----------
+
+YOUTUBE = re.compile(r"(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?v=|shorts/|live/|v/)|youtu\.be/)([\w-]{11})")
+YOUTUBE_ATTR = re.compile(r"""(?:videoid|data-youtube-id)=["']([\w-]{11})["']""")
+VIMEO = re.compile(r"player\.vimeo\.com/video/(\d+)")
+
+
+def find_videos(markup, extra_files=()):
+    """Видео в HTML: YouTube и Vimeo встраиваются в Telegraph, файлы .mp4 — ссылкой."""
+    videos = []
+    for match in [*YOUTUBE.finditer(markup), *YOUTUBE_ATTR.finditer(markup)]:
+        videos.append({"kind": "youtube", "url": f"https://www.youtube.com/watch?v={match.group(1)}"})
+    for match in VIMEO.finditer(markup):
+        videos.append({"kind": "vimeo", "url": f"https://vimeo.com/{match.group(1)}"})
+    for url in extra_files:
+        if url and url.startswith("http") and ".mp4" in url.lower():
+            videos.append({"kind": "file", "url": url})
+    return unique_videos(videos)
+
+
+def unique_videos(videos):
+    out, urls = [], set()
+    for video in videos:
+        if video["url"] not in urls:
+            urls.add(video["url"])
+            out.append(video)
+    return out[:MAX_VIDEOS]
+
+
+def entry_videos(entry):
+    markup = " ".join([entry.get("summary", "")] + [c.get("value", "") for c in entry.get("content", [])])
+    files = [m.get("url") for m in entry.get("media_content", [])
+             if m.get("medium") == "video" or m.get("type", "").startswith("video")]
+    return find_videos(markup, files)
+
+
 def fetch_feed(category, source):
+    """Статьи одной ленты и текст ошибки (None — лента ответила)."""
     try:
         resp = requests.get(source["url"], headers=HEADERS, timeout=20)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
     except Exception as exc:
         print(f"[!] {source['name']}: {exc}")
-        return []
+        return [], str(exc)[:150]
     items = []
+    move = category.get("move")
     for entry in feed.entries[:20]:
         link, title = entry.get("link"), clean_text(entry.get("title"))
         if not link or not title or skip_entry(link, title, category.get("skip_url", [])):
             continue
         ts = entry.get("published_parsed") or entry.get("updated_parsed")
+        if not ts:
+            continue  # без даты не понять, свежая ли новость, — не берём
         summary = clean_text(entry.get("summary"))
+        paragraphs = rss_paragraphs(entry)
+        text = f"{summary} {' '.join(paragraphs[-3:])}".lower()
+        if any(s in text for s in SKIP_TEXT):
+            continue
+        key = category["key"]
+        if move and re.search(move["pattern"], title, re.I):
+            key = move["to"]
         image, image_width = entry_image(entry)
         items.append({
-            "category": category["key"],
+            "category": key,
             "source": source["name"],
             "lang": source.get("lang"),
             "title": title,
@@ -197,23 +312,40 @@ def fetch_feed(category, source):
             "summary": summary,
             "image": image,
             "image_width": image_width,
-            "date": datetime(*ts[:6], tzinfo=timezone.utc) if ts else None,
-            "rss_paragraphs": rss_paragraphs(entry),
+            "videos": entry_videos(entry),
+            "date": datetime(*ts[:6], tzinfo=timezone.utc),
+            "rss_paragraphs": paragraphs,
             "text": dedup.story_text(title, summary),
         })
-    return items
+    return items, None
 
 
 def fetch_entries(categories):
-    """Все ленты читаются параллельно."""
+    """Все ленты читаются параллельно. Возвращает статьи и {лента: ошибка} для неответивших."""
     jobs = [(c, s) for c in categories for s in c["feeds"]]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = pool.map(lambda job: fetch_feed(*job), jobs)
-    return [item for items in results for item in items]
+        results = list(pool.map(lambda job: fetch_feed(*job), jobs))
+    items = [item for found, _ in results for item in found]
+    failures = {s["name"]: error for (_, s), (_, error) in zip(jobs, results) if error}
+    return items, failures
+
+
+def track_feeds(state, failures):
+    """Считает, сколько запусков подряд лента не отвечает, и предупреждает, если долго."""
+    fails = state["feed_fails"]
+    for name in list(fails):
+        if name not in failures:
+            del fails[name]
+    for name, error in failures.items():
+        fails[name] = fails.get(name, 0) + 1
+        if fails[name] >= FEED_ALERT_RUNS:
+            problem(f"feed:{name}", f"Лента «{name}» не отвечает уже {fails[name]} запусков подряд "
+                                    f"(примерно {fails[name] * INTERVAL_MIN // 60} ч): {error}. "
+                                    f"Если так и останется, её стоит заменить в feeds.py.")
 
 
 def fetch_article(url):
-    """Скачивает страницу статьи: основной текст, картинку и описание."""
+    """Скачивает страницу статьи: основной текст, картинку, описание и видео."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
@@ -229,12 +361,19 @@ def fetch_article(url):
 
     text = trafilatura.extract(page, url=url, include_comments=False,
                                include_tables=False, favor_precision=True) or ""
+    # Видео ищем только в теле статьи, чтобы не захватить ролики из боковых колонок
+    root = soup.find("article") or soup.find("main") or soup
+    files = [meta("og:video"), meta("og:video:url"), meta("og:video:secure_url")]
+    for video in root.find_all("video"):
+        files.append(video.get("src"))
+        files += [s.get("src") for s in video.find_all("source")]
     return {
         "paragraphs": [p.strip() for p in text.split("\n") if len(p.strip()) > 1],
         # Картинки для соцсетей у изданий обычно 1200 px и больше
         "images": [u for u in (meta("og:image"), meta("twitter:image"), meta("twitter:image:src"))
                    if u and u.startswith("http")],
         "description": clean_text(meta("og:description")),
+        "videos": find_videos(str(root) + " " + " ".join(f for f in files if f), files),
     }
 
 
@@ -244,54 +383,85 @@ class TranslationError(Exception):
     pass
 
 
-def gemini(prompt, schema):
+def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
     """Запрос к Gemini с JSON-ответом по схеме. Ключ бесплатный: https://aistudio.google.com/apikey"""
+    model = model or GEMINI_MODEL
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             # Строгая схема, иначе модель иногда ломает JSON на длинных текстах
             "responseSchema": schema,
-            "temperature": 0.2,
+            "temperature": temperature,
             "maxOutputTokens": 65536,
         },
     }
     error = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         if attempt:
             time.sleep(5 * attempt)
         try:
             resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=120,
             )
         except requests.RequestException as exc:
-            error = f"Gemini: {exc}"
+            error = f"Gemini ({model}): {exc}"
             continue
         if resp.status_code != 200:
-            error = f"Gemini {resp.status_code}: {resp.text[:300]}"
-            if resp.status_code in (400, 401, 403, 404):  # ключ или модель неверные — повтор не поможет
+            error = f"Gemini ({model}) {resp.status_code}: {resp.text[:300]}"
+            if resp.status_code == 404:
+                problem(f"gemini404:{model}", f"Модель Gemini «{model}» не найдена: похоже, Google снял её "
+                                              f"с поддержки. Поменяйте её название в news.yml или bot.py.")
+                break
+            if resp.status_code in (400, 401, 403):  # ключ неверный — повтор не поможет
+                problem("gemini-key", f"Gemini не принимает ключ или запрос ({resp.status_code}). "
+                                      f"Проверьте секрет GEMINI_API_KEY.")
                 break
             continue
         try:
             return json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
         except (KeyError, IndexError, ValueError) as exc:
-            error = f"Gemini вернул испорченный ответ: {exc}"
+            error = f"Gemini ({model}) вернул испорченный ответ: {exc}"
     raise TranslationError(error)
+
+
+def gemini_text(prompt, schema):
+    """Тексты для читателя пишет более сильная модель; если она недоступна или исчерпан
+    её лимит — та, что оценивает важность."""
+    models = list(dict.fromkeys([GEMINI_TEXT_MODEL, GEMINI_MODEL]))
+    error = None
+    for n, model in enumerate(models):
+        try:
+            return gemini(prompt, schema, model, attempts=2 if n < len(models) - 1 else 3)
+        except TranslationError as exc:
+            error = exc
+            print(f"[!] {exc}")
+    raise TranslationError(error)
+
+
+# Слово, где перемешаны кириллица и латиница («мaшина»), — верный признак сбоя нейросети
+MIXED_WORD = re.compile(r"\b(?=\w*[а-яё])(?=\w*[a-z])\w+\b", re.I)
+
+
+def garbled(text):
+    return bool(MIXED_WORD.search(text))
 
 
 # ---------- оценка важности ----------
 
 RATE_PROMPT = """Ты — выпускающий редактор международного новостного Telegram-канала \
-(политика и мир, бизнес, наука, технологии и ИИ, игры, кино и сериалы, спорт: футбол, бокс, теннис).
+(политика и мир, наука и медицина, технологии, искусственный интеллект, игры, кино и сериалы, \
+спорт: футбол, бокс, теннис).
 Оцени каждую новость по шкале от 1 до 10: насколько она важна и интересна широкой аудитории.
 10 — событие мирового масштаба, о котором говорят все.
 8–9 — крупная новость, которую обсуждают во всём мире или во всей отрасли: громкий анонс \
-или релиз, большая сделка, важное открытие, крупный трансфер, титульный бой, финал турнира.
+или релиз, новая нейросеть от крупной компании, прорыв в лечении болезни, важное открытие, \
+крупный трансфер, титульный бой, финал турнира.
 5–7 — заметная новость своей отрасли.
-3–4 — рядовая заметка.
+3–4 — рядовая заметка, в том числе отчёты компаний и движение акций.
 1–2 — проходное: обзоры, подборки, гайды, скидки, слухи без источника, колонки мнений, \
-мелкие локальные новости.
+реклама, мелкие локальные новости, исследования на мышах без практического значения.
 Ответь JSON-массивом целых чисел той же длины и в том же порядке, что и список.
 
 """
@@ -315,7 +485,8 @@ def rate_stories(pool):
             for story, value in zip(batch, scores):
                 story["importance"] = max(1, min(10, int(value)))
         except Exception as exc:
-            print(f"[!] не удалось оценить важность: {exc}")
+            problem("rate", f"Gemini не смог оценить важность новостей: {exc}. "
+                            f"Пока это так, бот публикует почти без отбора.")
             for story in batch:
                 story["rate_tries"] = story.get("rate_tries", 0) + 1
             break
@@ -378,10 +549,12 @@ def eligible(story, now):
 def update_pool(state, seen, cutoff):
     pool = state["pool"]
     in_pool = {link_key(m["link"]) for s in pool for m in s["members"]}
+    found, failures = fetch_entries(CATEGORIES)
+    track_feeds(state, failures)
     items = {}
-    for item in fetch_entries(CATEGORIES):
+    for item in found:
         key = link_key(item["link"])
-        if key not in seen and key not in in_pool and (item["date"] is None or item["date"] > cutoff):
+        if key not in seen and key not in in_pool and item["date"] > cutoff:
             items.setdefault(key, item)
     items = list(items.values())
 
@@ -500,19 +673,45 @@ def is_russian(text, share=0.5):
     return not letters or sum(c >= "а" for c in letters) / len(letters) > share
 
 
+TRANSLATE_PROMPT = (
+    "Переведи на язык «{lang}» каждую строку из JSON-массива. Это новостная статья: "
+    "пиши естественно и грамотно, в стиле качественного новостного издания, без пояснений и сокращений. "
+    "Имена, названия компаний, игр и фильмов передавай так, как их принято писать в русских СМИ. "
+    "Перед ответом перечитай перевод: в нём не должно быть опечаток, пропущенных или лишних букв, "
+    "склеенных слов и слов, где смешаны русские и латинские буквы. "
+    "Ответь только JSON-массивом строк той же длины и в том же порядке.\n\n"
+)
+
+
+def chunks(parts, limit):
+    """Делит абзацы на куски до limit символов, не разрывая абзацы."""
+    batch, size = [], 0
+    for part in parts:
+        if batch and size + len(part) > limit:
+            yield batch
+            batch, size = [], 0
+        batch.append(part)
+        size += len(part)
+    if batch:
+        yield batch
+
+
 def _gemini_translate(parts):
-    """Перевод нейросетью Gemini: один запрос на всю статью, качество как у редактора."""
-    prompt = (
-        f"Переведи на язык «{TRANSLATE_TO}» каждую строку из JSON-массива. Это новостная статья: "
-        "пиши естественно, в стиле качественного новостного издания, без пояснений и сокращений. "
-        "Имена, названия компаний, игр и фильмов передавай так, как их принято писать в русских СМИ. "
-        "Ответь только JSON-массивом строк той же длины и в том же порядке.\n\n"
-        + json.dumps(parts, ensure_ascii=False)
-    )
-    result = gemini(prompt, {"type": "ARRAY", "items": {"type": "STRING"}})
-    if isinstance(result, list) and len(result) == len(parts):
-        return [str(r) for r in result]
-    raise TranslationError("Gemini вернул ответ не того формата")
+    """Перевод нейросетью Gemini кусками: на коротких ответах модель почти не ошибается в буквах."""
+    result = []
+    for batch in chunks(parts, TRANSLATE_CHUNK):
+        prompt = TRANSLATE_PROMPT.format(lang=TRANSLATE_TO) + json.dumps(batch, ensure_ascii=False)
+        for attempt in range(2):
+            translated = gemini_text(prompt, {"type": "ARRAY", "items": {"type": "STRING"}})
+            if not isinstance(translated, list) or len(translated) != len(batch):
+                raise TranslationError("Gemini вернул ответ не того формата")
+            translated = [str(r) for r in translated]
+            if attempt == 0 and any(garbled(t) for t in translated):
+                print("[!] в переводе слова со смешанными буквами — перевожу этот кусок заново")
+                continue
+            break
+        result += translated
+    return result
 
 
 def _translate_chunk(translator, text):
@@ -596,16 +795,19 @@ def translate(parts, lang):
 
 DIGEST_PROMPT = """Ты — редактор новостного Telegram-канала. Читатель листает ленту: \
 за 10 секунд он должен понять, что произошло и почему это важно, даже если впервые слышит об этой теме.
-Сделай по статье ниже JSON с полями (всё на русском):
+Сделай по статье ниже JSON с полями (всё на русском, грамотно, без опечаток):
 title — понятный заголовок до 100 символов. Сразу ясно, о ком или о чём речь: \
 не «Альтман ответил критикам», а «Глава OpenAI Сэм Альтман ответил на обвинения в…». \
 Малоизвестных людей, компании, игры, команды поясняй парой слов. Без кликбейта и вопросов.
-lead — суть в 2–3 коротких предложениях, до 320 символов: что случилось и почему это важно. \
+lead — краткий пересказ: что случилось, в 2 коротких предложениях, до 280 символов. \
 Без воды, вводных слов и повтора заголовка.
-points — 0–3 ключевых факта (цифры, сроки, последствия), каждый до 100 символов. \
+points — 0–2 ключевых факта (цифры, сроки), каждый до 90 символов. \
 Не повторяй lead. Если добавить нечего — пустой массив.
-paragraphs — полный перевод абзацев статьи, столько же элементов и в том же порядке. \
-Пиши естественно, в стиле качественного издания. Имена и названия — как принято в русских СМИ.
+meaning — ответ на вопрос «Что это значит?»: 1–3 простых предложения, до 260 символов. \
+Объясни, что эта новость меняет и почему она важна, так, будто рассказываешь другу, \
+который совсем не разбирается в теме: без терминов и канцелярита, без повтора lead. \
+Если есть практическое следствие (что изменится, для кого, когда), назови его. \
+Не выдумывай того, чего нет в статье.
 
 """
 
@@ -615,9 +817,9 @@ DIGEST_SCHEMA = {
         "title": {"type": "STRING"},
         "lead": {"type": "STRING"},
         "points": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "paragraphs": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "meaning": {"type": "STRING"},
     },
-    "required": ["title", "lead", "points", "paragraphs"],
+    "required": ["title", "lead", "points", "meaning"],
 }
 
 
@@ -631,29 +833,38 @@ def first_sentences(text, limit=320):
 
 
 def digest(item, summary, paragraphs):
-    """Заголовок, суть в 2–3 предложениях, ключевые факты и полный перевод — одним запросом."""
-    if GEMINI_API_KEY and TRANSLATE_TO:
-        article = {"title": item["title"], "summary": summary, "paragraphs": paragraphs}
+    """Заголовок, краткий пересказ, факты, «Что это значит?» и полный перевод для Telegraph."""
+    full = []
+    if paragraphs:
         try:
-            data = gemini(DIGEST_PROMPT + json.dumps(article, ensure_ascii=False), DIGEST_SCHEMA)
-            title, lead = str(data["title"]).strip(), str(data["lead"]).strip()
-            points = [str(p).strip() for p in data.get("points", []) if str(p).strip()][:3]
-            if title and lead and (TRANSLATE_TO != "ru" or is_russian(f"{title} {lead}", share=0.3)):
-                full = [str(p) for p in data.get("paragraphs", [])]
-                if paragraphs and len(full) < len(paragraphs) * 0.8:
-                    try:  # перевод абзацев потерялся — переводим их отдельно
-                        full = translate(paragraphs, item["lang"])
-                    except TranslationError as exc:
-                        print(f"[!] полный текст не переведён, пост без «Читать полностью»: {exc}")
-                        full = []
-                return {"title": title, "lead": lead, "points": points, "paragraphs": full}
-            print("[!] выжимка вернулась не того формата, перевожу без неё")
-        except Exception as exc:
-            print(f"[!] не удалось сделать выжимку, перевожу без неё: {exc}")
+            full = translate(paragraphs, item["lang"])
+        except TranslationError as exc:
+            print(f"[!] полный текст не переведён, пост без «Читать полностью»: {exc}")
+    if GEMINI_API_KEY and TRANSLATE_TO:
+        article = {"title": item["title"], "summary": summary,
+                   "text": "\n".join(take_chars(paragraphs, 8000))}
+        prompt = DIGEST_PROMPT + json.dumps(article, ensure_ascii=False)
+        for attempt in range(2):
+            try:
+                data = gemini_text(prompt, DIGEST_SCHEMA)
+            except Exception as exc:
+                print(f"[!] не удалось сделать выжимку, перевожу без неё: {exc}")
+                break
+            title, lead = str(data.get("title", "")).strip(), str(data.get("lead", "")).strip()
+            meaning = str(data.get("meaning", "")).strip()
+            points = [str(p).strip() for p in data.get("points", []) if str(p).strip()][:2]
+            text = " ".join([title, lead, meaning, *points])
+            if not title or not lead or (TRANSLATE_TO == "ru" and not is_russian(text, share=0.3)):
+                print("[!] выжимка вернулась не того формата")
+                continue
+            if attempt == 0 and garbled(text):
+                print("[!] в выжимке слова со смешанными буквами — прошу переписать")
+                continue
+            return {"title": title, "lead": lead, "points": points, "meaning": meaning, "paragraphs": full}
     # Запасной вариант: обычный перевод, суть — первые предложения описания
-    translated = translate([item["title"], summary, *paragraphs], item["lang"])
+    translated = translate([item["title"], summary], item["lang"])
     return {"title": translated[0], "lead": first_sentences(translated[1]), "points": [],
-            "paragraphs": translated[2:]}
+            "meaning": "", "paragraphs": full}
 
 
 # ---------- Telegraph (полный текст внутри Telegram) ----------
@@ -669,8 +880,18 @@ def telegraph_token():
     return token
 
 
-def telegraph_page(title, paragraphs, image, item):
+def video_node(video):
+    """YouTube и Vimeo Telegraph показывает встроенным плеером, остальное — ссылкой."""
+    if video["kind"] in ("youtube", "vimeo"):
+        src = f"/embed/{video['kind']}?url={quote(video['url'], safe='')}"
+        return {"tag": "figure", "children": [{"tag": "iframe", "attrs": {"src": src}}]}
+    return {"tag": "p", "children": [
+        {"tag": "a", "attrs": {"href": video["url"]}, "children": ["▶️ Смотреть видео из статьи"]}]}
+
+
+def telegraph_page(title, paragraphs, image, item, videos):
     nodes = [{"tag": "img", "attrs": {"src": image}}] if image else []
+    nodes += [video_node(v) for v in videos]
     size = 0
     for paragraph in paragraphs:
         size += len(paragraph.encode()) + 40
@@ -699,7 +920,7 @@ def telegraph_page(title, paragraphs, image, item):
 # ---------- публикация ----------
 
 def tg(method, files=None, **params):
-    params["chat_id"] = CHANNEL_ID
+    params.setdefault("chat_id", CHANNEL_ID)
     data = requests.post(f"{TG_API}/{method}", data=params, files=files, timeout=60).json()
     if not data.get("ok"):
         raise RuntimeError(f"{method}: {data.get('description')}")
@@ -725,21 +946,30 @@ def take_chars(paragraphs, limit):
 
 
 def build_post(category, post, sources, limit):
-    """Короткий пост: заголовок, суть, до трёх фактов, источники и рубрика. Без ссылок в тексте."""
+    """Короткий пост: заголовок, пересказ, факты, «Что это значит?», источники и рубрика."""
     head = f"{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
     names = " · ".join(sources[:4])
     tail = f"\n\n<i>{html.escape(names)}</i>  #{category['tag']}"
-    lead, points = post["lead"], list(post["points"])
+    lead, points, meaning = post["lead"], list(post["points"]), post.get("meaning", "")
     while True:
         body = html.escape(lead)
         if points:
             body += "\n\n" + "\n".join(f"▪️ {html.escape(p)}" for p in points)
-        if len(head) + len(body) + len(tail) <= limit or (not points and len(lead) < 120):
+        if meaning:
+            body += f"\n\n❓ <b>Что это значит?</b>\n{html.escape(meaning)}"
+        if len(head) + len(body) + len(tail) <= limit:
             return head + body + tail
+        # Сначала убираем факты, потом сокращаем объяснение и пересказ
         if points:
-            points.pop()  # сначала убираем факты, суть оставляем
-        else:
+            points.pop()
+        elif len(meaning) > 160:
+            meaning = shorten(meaning, len(meaning) - 40)
+        elif len(lead) > 120:
             lead = shorten(lead, len(lead) - 40)
+        elif meaning:
+            meaning = ""
+        else:
+            return head + body + tail
 
 
 def keyboard(page, sources):
@@ -774,25 +1004,87 @@ def download_image(urls):
     return None
 
 
-def send_post(category, post, sources, image, markup):
+def download_video(url):
+    """Файл .mp4 из статьи для шапки поста: байты или None, если не скачался или слишком большой."""
+    limit = MAX_VIDEO_MB * 1024 * 1024
+    data = bytearray()
+    try:
+        with requests.get(url, headers=HEADERS, timeout=30, stream=True) as resp:
+            resp.raise_for_status()
+            if int(resp.headers.get("Content-Length") or 0) > limit:
+                print("[!] видео больше лимита Telegram, в шапке будет картинка")
+                return None
+            for part in resp.iter_content(1 << 20):
+                data += part
+                if len(data) > limit:
+                    print("[!] видео больше лимита Telegram, в шапке будет картинка")
+                    return None
+    except Exception as exc:
+        print(f"[!] видео недоступно: {exc}")
+        return None
+    return bytes(data) or None
+
+
+def send_video_post(category, post, names, markup, videos):
+    """Пост с видео в шапке вместо картинки. None — ни одно видео не подошло."""
+    for video in videos:
+        try:
+            if video["kind"] == "file":
+                data = download_video(video["url"])
+                if not data:
+                    continue
+                # Ролик загружаем сами: в шапке он играет прямо в Telegram
+                return tg("sendVideo", files={"video": ("video.mp4", data, "video/mp4")},
+                          supports_streaming="true", parse_mode="HTML", reply_markup=markup,
+                          caption=build_post(category, post, names, 1024))
+            # YouTube и Vimeo: Telegram сам ставит плеер над текстом, ролик смотрится не выходя из канала
+            return tg("sendMessage", parse_mode="HTML", reply_markup=markup,
+                      text=build_post(category, post, names, 1500),
+                      link_preview_options=json.dumps({"url": video["url"], "prefer_large_media": True,
+                                                       "show_above_text": True}))
+        except Exception as exc:
+            if any(s in str(exc) for s in FATAL_TG_ERRORS):
+                raise
+            print(f"[!] не удалось отправить с видео, пробую дальше: {exc}")
+    return None
+
+
+def send_post(category, post, sources, image, markup, videos=()):
+    """Публикует пост и возвращает сообщение Telegram."""
     names = [name for name, _ in sources]
+    if VIDEO_HEADER and videos:
+        message = send_video_post(category, post, names, markup, videos)
+        if message:
+            return message
     if image:
         _, data, kind = image
         try:
             # Сверху — только картинка; файл загружаем сами, без пережатия чужим сервером
-            tg("sendPhoto", files={"photo": ("photo." + kind.split("/")[1], data, kind)},
-               parse_mode="HTML", reply_markup=markup, caption=build_post(category, post, names, 1024))
-            return
+            return tg("sendPhoto", files={"photo": ("photo." + kind.split("/")[1], data, kind)},
+                      parse_mode="HTML", reply_markup=markup, caption=build_post(category, post, names, 1024))
         except Exception as exc:
             if any(s in str(exc) for s in FATAL_TG_ERRORS):
                 raise
             print(f"[!] не удалось отправить с фото, отправляю текстом: {exc}")
-    tg("sendMessage", parse_mode="HTML", reply_markup=markup,
-       text=build_post(category, post, names, 1500),
-       link_preview_options=json.dumps({"is_disabled": True}))
+    return tg("sendMessage", parse_mode="HTML", reply_markup=markup,
+              text=build_post(category, post, names, 1500),
+              link_preview_options=json.dumps({"is_disabled": True}))
+
+
+def post_link(message):
+    """Ссылка на пост в канале: https://t.me/канал/номер."""
+    number = message.get("message_id") if isinstance(message, dict) else None
+    if not number:
+        return None
+    if CHANNEL_ID.startswith("@"):
+        return f"https://t.me/{CHANNEL_ID[1:]}/{number}"
+    if CHANNEL_ID.startswith("-100"):
+        return f"https://t.me/c/{CHANNEL_ID[4:]}/{number}"
+    return None
 
 
 def publish(category, story):
+    """Публикует сюжет. Возвращает заголовок и ссылку для вечернего дайджеста."""
     item = story["main"]
     sources = {item["source"]: item["link"]}
     for member in story["members"]:
@@ -805,17 +1097,21 @@ def publish(category, story):
         paragraphs = item["rss_paragraphs"]
     paragraphs = take_chars(paragraphs, MAX_ARTICLE_CHARS) if FULL_TEXT else []
     image = download_image(image_candidates(item, article))
+    videos = unique_videos(article.get("videos", []) + item.get("videos", []))
+    if videos:
+        print(f"Видео в статье: {', '.join(v['url'] for v in videos)}")
 
     summary = item["summary"]
     if len(summary) < 80:
         summary = article.get("description") or " ".join(paragraphs[:2]) or summary
     post = digest(item, summary, paragraphs)
 
-    # Полный перевод — в Telegraph, по кнопке «Читать полностью»
+    # Полный перевод и видео — в Telegraph, по кнопке «Читать полностью»; видео ещё и в шапке поста
     page = None
     if len(post["paragraphs"]) >= 3:
-        page = telegraph_page(post["title"], post["paragraphs"], image[0] if image else None, item)
-    send_post(category, post, sources, image, keyboard(page, sources))
+        page = telegraph_page(post["title"], post["paragraphs"], image[0] if image else None, item, videos)
+    message = send_post(category, post, sources, image, keyboard(page, sources), videos)
+    return {"title": post["title"], "url": page or post_link(message) or item["link"]}
 
 
 def as_story(pooled):
@@ -824,6 +1120,95 @@ def as_story(pooled):
                                        len(i["summary"]), i["date"] or EPOCH))
     return {"main": main, "members": members}
 
+
+# ---------- вечерний дайджест ----------
+
+def local_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(DIGEST_TZ)
+    except Exception:
+        print(f"[!] часовой пояс {DIGEST_TZ} не найден, считаю по Москве (UTC+3)")
+        return timezone(timedelta(hours=3))
+
+
+def build_digest(items, now_local):
+    """Сообщения дайджеста: кликабельные заголовки по рубрикам. Длинный делится на части."""
+    head = (f"🗞 <b>Главное за день · {now_local.day} {MONTHS[now_local.month - 1]}</b>\n"
+            f"<i>Нажмите на заголовок, чтобы прочитать новость полностью</i>")
+    lines = []
+    for category in CATEGORIES:
+        own = [d for d in items if d["category"] == category["key"]]
+        if not own:
+            continue
+        lines.append("")
+        lines.append(f"{category['emoji']} <b>{html.escape(category['title'])}</b>")
+        for d in own:
+            lines.append(f'▫️ <a href="{html.escape(d["url"], quote=True)}">'
+                         f'{html.escape(shorten(d["title"], 110))}</a>')
+    messages, current, links = [], head, 0
+    for line in lines:
+        # Лимит Telegram — 4096 символов; ссылок в одном сообщении держим не больше 40
+        if len(current) + len(line) > 3800 or (line.startswith("▫️") and links >= 40):
+            messages.append(current)
+            current, links = "🗞 <b>Главное за день (продолжение)</b>", 0
+        current += "\n" + line
+        links += line.startswith("▫️")
+    messages.append(current + "\n\n#дайджест")
+    return messages
+
+
+def pin_digest(state, message_id):
+    """Закрепляет свежий дайджест и открепляет прошлый: в шапке канала всегда последний."""
+    try:
+        tg("pinChatMessage", message_id=message_id, disable_notification="true")
+    except Exception as exc:
+        problem("pin", f"Не удалось закрепить дайджест: {exc}. Дайте боту в канале право "
+                       f"изменять чужие публикации: без него Telegram не разрешает закреплять.")
+        return
+    old = state.get("digest_pinned")
+    if old and old != message_id:
+        try:
+            tg("unpinChatMessage", message_id=old)
+        except Exception as exc:
+            print(f"[!] не удалось открепить прошлый дайджест: {exc}")
+    state["digest_pinned"] = message_id
+
+
+def maybe_digest(state, force=False):
+    """Раз в день после DIGEST_HOUR публикует дайджест всего, что вышло с прошлого раза.
+    force — опубликовать сейчас для проверки, не сбивая вечерний."""
+    if DIGEST_HOUR < 0 and not force:
+        return
+    now_local = datetime.now(local_tz())
+    today = now_local.date().isoformat()
+    if not force and (now_local.hour < DIGEST_HOUR or state.get("digest_date") == today):
+        return
+    items = list(state["digest"])
+    if not items:
+        print("Дайджест: с прошлого раза ничего не опубликовано")
+        if not force:
+            state["digest_date"] = today
+        return
+    first = None
+    try:
+        for text in build_digest(items, now_local):
+            message = tg("sendMessage", parse_mode="HTML", text=text,
+                         link_preview_options=json.dumps({"is_disabled": True}))
+            first = first or message
+    except Exception as exc:
+        problem("digest", f"Не удалось опубликовать вечерний дайджест: {exc}. Бот попробует ещё раз "
+                          f"через 10 минут.")
+        return
+    print(f"Дайджест опубликован: {len(items)} новостей")
+    if first:
+        pin_digest(state, first["message_id"])
+    if not force:
+        state["digest_date"] = today
+        state["digest"] = []
+
+
+# ---------- запуск ----------
 
 def prepare(state, seen):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
@@ -836,7 +1221,8 @@ def run(only=None):
     if not BOT_TOKEN or not CHANNEL_ID:
         sys.exit("Задайте переменные окружения BOT_TOKEN и CHANNEL_ID (см. README)")
     if not GEMINI_API_KEY:
-        print("[!] GEMINI_API_KEY не задан — нет оценки важности, перевод через Google Translate")
+        problem("no-gemini", "Не задан GEMINI_API_KEY: нет оценки важности и выжимок, "
+                             "перевод через Google Translate.")
     state = load_state()
     seen = set(state["posted"])
     prepare(state, seen)
@@ -867,15 +1253,15 @@ def run(only=None):
             remember(state, seen, story["members"])
             continue
         try:
-            publish(category, story)
+            info = publish(category, story)
         except TranslationError as exc:
             # Переводчик недоступен — новость остаётся в очереди до следующего запуска
-            print(f"[!] не удалось перевести, новость отложена до следующего запуска: {exc}")
+            problem("translate", f"Не получается перевести новости, посты отложены: {exc}")
             break
         except Exception as exc:
             if any(s in str(exc) for s in FATAL_TG_ERRORS):
-                print(f"[!] Telegram: {exc}\n    Сделайте бота администратором канала "
-                      "с правом «Публикация сообщений» и проверьте CHANNEL_ID (например, @fluxwirenews)")
+                problem("telegram", f"Telegram не даёт публиковать в канал: {exc}. Проверьте, что бот — "
+                                    f"администратор канала с правом «Публикация сообщений», и CHANNEL_ID.")
                 break
             print(f"[!] {story['main']['link']}: {exc}")
             state["pool"].remove(pooled)
@@ -884,14 +1270,38 @@ def run(only=None):
             continue
         state["pool"].remove(pooled)
         remember(state, seen, story["members"])
+        state["last_post"] = time.time()
+        state["digest"].append({"ts": time.time(), "category": category["key"], **info})
         extra = f" (+{len(story['members']) - 1} похожих)" if len(story["members"]) > 1 else ""
         print(f"[{category['key']}] опубликовано ({story_score(pooled, now):.1f} баллов): "
               f"{story['main']['title']}{extra}")
         break
+
+    quiet = (time.time() - state["last_post"]) / 3600
+    if quiet >= QUIET_HOURS:
+        problem("quiet", f"Уже {quiet:.0f} ч в канале нет ни одного поста. Если это не тихая ночь, "
+                         f"загляните в журнал запусков на GitHub.")
+    maybe_digest(state)
+    send_alerts(state)
     save_state(state)
 
 
 # ---------- проверки ----------
+
+def digest_now():
+    state = load_state()
+    maybe_digest(state, force=True)
+    send_alerts(state)
+    save_state(state)
+
+
+def test_alert():
+    if not ADMIN_CHAT_ID:
+        sys.exit("ADMIN_CHAT_ID не задан (см. README, раздел «Предупреждения»)")
+    tg("sendMessage", chat_id=ADMIN_CHAT_ID,
+       text="✅ Проверка связи: если что-то сломается, бот напишет сюда.")
+    print("Пробное предупреждение отправлено")
+
 
 def rank():
     state = load_state()
@@ -917,7 +1327,7 @@ def check_feeds():
 
 def check_dupes():
     cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS)
-    items = [i for i in fetch_entries(CATEGORIES) if i["date"] is None or i["date"] > cutoff]
+    items = [i for i in fetch_entries(CATEGORIES)[0] if i["date"] > cutoff]
     groups = [g for g in dedup.group_stories([i["text"] for i in items])
               if len({items[k]["source"] for k in g}) > 1]
     print(f"Свежих новостей: {len(items)}. Сюжетов, о которых пишут несколько изданий: {len(groups)}\n")
@@ -934,6 +1344,10 @@ if __name__ == "__main__":
         check_dupes()
     elif "--rank" in sys.argv:
         rank()
+    elif "--digest" in sys.argv:
+        digest_now()
+    elif "--test-alert" in sys.argv:
+        test_alert()
     elif "--loop" in sys.argv:
         while True:
             started = time.time()
@@ -941,6 +1355,11 @@ if __name__ == "__main__":
                 run()
             except Exception as exc:
                 print(f"[!] ошибка запуска: {exc}")
+                report_crash(exc)
             time.sleep(max(30, INTERVAL_MIN * 60 - (time.time() - started)))
     else:
-        run(sys.argv[1] if len(sys.argv) > 1 else None)
+        try:
+            run(sys.argv[1] if len(sys.argv) > 1 else None)
+        except Exception as exc:
+            report_crash(exc)
+            raise
