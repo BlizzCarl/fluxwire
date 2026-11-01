@@ -14,7 +14,7 @@
   7. Если что-то сломалось, бот пишет об этом в личку (ADMIN_CHAT_ID).
   8. Новые факты об уже опубликованном сюжете выходят «🔄 Обновлением» — ответом на старый пост.
   9. Срочное (URGENT_SCORE) приходит с пометкой ⚡️ и звуком, остальное — без звука.
- 10. В канале закреплена навигация по рубрикам; бот обновляет её сам, если рубрики изменились.
+ 10. В закрепе — только свежий дайджест.
 
 Запуск:
     python bot.py                — один пост: для GitHub Actions / cron
@@ -73,7 +73,7 @@ SILENT_POSTS = os.getenv("SILENT_POSTS", "1") == "1"  # обычные пост�
 UPDATES = os.getenv("UPDATES", "1") == "1"  # новые факты о вышедшем сюжете — ответом на старый пост
 UPDATE_MAX = int(os.getenv("UPDATE_MAX", "3"))  # не больше стольких обновлений на один сюжет
 UPDATE_GAP_MIN = int(os.getenv("UPDATE_GAP_MIN", "60"))  # и не чаще раза в столько минут
-NAVIGATION = os.getenv("NAVIGATION", "1") == "1"  # закреплённое сообщение с рубриками
+NAVIGATION = os.getenv("NAVIGATION", "0") == "1"  # закреплённое сообщение с рубриками (выключено)
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "FLUX WIRE").strip()  # название канала в навигации
 DEDUP_HOURS = int(os.getenv("DEDUP_HOURS", "48"))  # сколько помнить сюжеты для отсева дублей
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR", "21"))  # час вечернего дайджеста; -1 — выключить
@@ -973,7 +973,7 @@ def build_post(category, post, sources, limit, urgent=False):
     mark = "⚡️ " if urgent else ""
     head = f"{mark}{category['emoji']} <b>{html.escape(shorten(post['title'], 160))}</b>\n\n"
     names = " · ".join(sources[:4])
-    tail = f"\n\n<i>{html.escape(names)}</i>  #{category['tag']}"
+    tail = f"\n\n<i>{html.escape(names)}</i>  {hashtag(category['tag'])}"
     lead, points, meaning = post["lead"], list(post["points"]), post.get("meaning", "")
     nxt = post.get("next", "")
     while True:
@@ -1118,6 +1118,28 @@ def post_link(message):
     return None
 
 
+_USERNAME = []
+
+
+def channel_username():
+    """Имя публичного канала без @ (например, fluxwirenews)."""
+    if not _USERNAME:
+        name = CHANNEL_ID[1:] if CHANNEL_ID.startswith("@") else ""
+        if not name:
+            try:
+                name = tg("getChat").get("username") or ""
+            except Exception as exc:
+                print(f"[!] не удалось узнать имя канала: {exc}")
+        _USERNAME.append(name)
+    return _USERNAME[0]
+
+
+def hashtag(tag):
+    """#тег@канал: по нажатию Telegram ищет только в этом канале, а не по всем публичным."""
+    name = channel_username()
+    return f"#{tag}@{name}" if name else f"#{tag}"
+
+
 def story_sources(story):
     item = story["main"]
     sources = {item["source"]: item["link"]}
@@ -1210,7 +1232,7 @@ def maybe_update(state, category, story, old, urgent=False):
     names = " · ".join(name for name, _ in sources[:4])
     mark = "⚡️ " if urgent else ""
     body = (f"{mark}🔄 <b>Обновление</b>\n\n{html.escape(shorten(text, 400))}\n\n"
-            f"<i>{html.escape(names)}</i>  #{category['tag']}")
+            f"<i>{html.escape(names)}</i>  {hashtag(category['tag'])}")
     try:
         # Ответом на исходный пост: сюжет развивается в одной ветке. Если тот пост удалён — не публикуем
         tg("sendMessage", parse_mode="HTML", text=body, reply_markup=keyboard(None, sources),
@@ -1266,7 +1288,7 @@ def build_digest(items, now_local):
             current, links = "🗞 <b>Главное за день (продолжение)</b>", 0
         current += "\n" + line
         links += line.startswith("▫️")
-    messages.append(current + "\n\n#дайджест")
+    messages.append(current + "\n\n" + hashtag("дайджест"))
     return messages
 
 
@@ -1292,9 +1314,9 @@ def pin_digest(state, message_id):
 def navigation_text():
     lines = [f"🧭 <b>Навигация {html.escape(CHANNEL_NAME)}</b>",
              "<i>Нажмите на хэштег, чтобы увидеть новости только этой рубрики</i>", ""]
-    lines += [f"{c['emoji']} #{c['tag']} — {html.escape(c['title'])}" for c in CATEGORIES]
+    lines += [f"{c['emoji']} {hashtag(c['tag'])} — {html.escape(c['title'])}" for c in CATEGORIES]
     if DIGEST_HOUR >= 0:
-        lines += ["", f"🗞 #дайджест — главное за день, каждый вечер в {DIGEST_HOUR}:00 по Москве"]
+        lines += ["", f"🗞 {hashtag('дайджест')} — главное за день, каждый вечер в {DIGEST_HOUR}:00"]
     lines += ["", "<b>Значки в постах</b>",
               "⚡️ — срочная новость, приходит со звуком",
               "🔄 — обновление сюжета: ответ на прошлый пост о нём",
@@ -1305,8 +1327,18 @@ def navigation_text():
 
 
 def ensure_navigation(state):
-    """Публикует и закрепляет навигацию. Если рубрики изменились — заменяет старую."""
+    """Публикует и закрепляет навигацию. Если рубрики изменились — заменяет старую.
+    Если навигация выключена — убирает уже опубликованную: в закрепе остаётся только дайджест."""
     if not NAVIGATION:
+        old = state.pop("nav_msg", None)
+        state.pop("nav_sign", None)
+        if old:
+            for method in ("unpinChatMessage", "deleteMessage"):
+                try:
+                    tg(method, message_id=old)
+                except Exception as exc:
+                    print(f"[!] навигация: {method}: {exc}")
+            print("Навигация откреплена и удалена")
         return
     text = navigation_text()
     sign = hashlib.sha1(text.encode()).hexdigest()[:12]
