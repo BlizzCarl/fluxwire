@@ -899,6 +899,20 @@ def is_repeat(story, recent):
     return recent[close[number - 1]] if 1 <= number <= len(close) else None
 
 
+def gemini_text(prompt, schema):
+    """Тексты для читателя пишет более сильная модель; если она недоступна или исчерпан
+    её лимит — та, что оценивает важность."""
+    models = list(dict.fromkeys([GEMINI_TEXT_MODEL, GEMINI_MODEL]))
+    error = None
+    for n, model in enumerate(models):
+        try:
+            return gemini(prompt, schema, model, attempts=2 if n < len(models) - 1 else 3)
+        except TranslationError as exc:
+            error = exc
+            print(f"[!] {exc}")
+    raise TranslationError(error)
+
+
 # ---------- перевод ----------
 
 def is_russian(text, share=0.5):
