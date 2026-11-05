@@ -420,6 +420,10 @@ class TranslationError(Exception):
     pass
 
 
+class Overloaded(TranslationError):
+    """Gemini перегружен (503) или исчерпан лимит (429): это временно."""
+
+
 def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
     """Запрос к Gemini с JSON-ответом по схеме. Ключ бесплатный: https://aistudio.google.com/apikey"""
     model = model or GEMINI_MODEL
@@ -433,20 +437,24 @@ def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
             "maxOutputTokens": 65536,
         },
     }
-    error = None
+    error, busy, wait = None, False, 0
     for attempt in range(attempts):
-        if attempt:
-            time.sleep(5 * attempt)
+        if wait:
+            time.sleep(wait)
+        wait = 5 * (attempt + 1)
         try:
             resp = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=120,
             )
         except requests.RequestException as exc:
-            error = f"Gemini ({model}): {exc}"
+            error, busy = f"Gemini ({model}): {exc}", False
             continue
         if resp.status_code != 200:
             error = f"Gemini ({model}) {resp.status_code}: {resp.text[:300]}"
+            busy = resp.status_code in (429, 503)
+            if busy:
+                wait = 20 * (attempt + 1)  # перегрузка проходит не за секунды
             if resp.status_code == 404:
                 problem(f"gemini404:{model}", f"Модель Gemini «{model}» не найдена: похоже, Google снял её "
                                               f"с поддержки. Поменяйте её название в news.yml или bot.py.")
@@ -459,22 +467,8 @@ def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
         try:
             return json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
         except (KeyError, IndexError, ValueError) as exc:
-            error = f"Gemini ({model}) вернул испорченный ответ: {exc}"
-    raise TranslationError(error)
-
-
-def gemini_text(prompt, schema):
-    """Тексты для читателя пишет более сильная модель; если она недоступна или исчерпан
-    её лимит — та, что оценивает важность."""
-    models = list(dict.fromkeys([GEMINI_TEXT_MODEL, GEMINI_MODEL]))
-    error = None
-    for n, model in enumerate(models):
-        try:
-            return gemini(prompt, schema, model, attempts=2 if n < len(models) - 1 else 3)
-        except TranslationError as exc:
-            error = exc
-            print(f"[!] {exc}")
-    raise TranslationError(error)
+            error, busy = f"Gemini ({model}) вернул испорченный ответ: {exc}", False
+    raise (Overloaded if busy else TranslationError)(error)
 
 
 # Слово, где перемешаны кириллица и латиница («мaшина»), — верный признак сбоя нейросети
@@ -769,6 +763,135 @@ def is_repeat(story, recent):
     try:
         answer = gemini(REPEAT_PROMPT + text, {"type": "OBJECT", "properties": {"repeat": {"type": "INTEGER"}},
                                                "required": ["repeat"]})
+        number = int(answer.get("repeat", 0))
+    except Exception as exc:
+        print(f"[!] не удалось проверить повтор: {exc}")
+        return None
+    return recent[close[number - 1]] if 1 <= number <= len(close) else None
+
+
+# ---------- устойчивость к перегрузке Gemini (503/429) ----------
+
+class Overloaded(TranslationError):
+    """Gemini перегружен (503) или исчерпан лимит (429): это временно."""
+
+
+def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
+    """Запрос к Gemini с JSON-ответом по схеме. При перегрузке ждёт дольше."""
+    model = model or GEMINI_MODEL
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "temperature": temperature,
+            "maxOutputTokens": 65536,
+        },
+    }
+    error, busy, wait = None, False, 0
+    for attempt in range(attempts):
+        if wait:
+            time.sleep(wait)
+        wait = 5 * (attempt + 1)
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=120,
+            )
+        except requests.RequestException as exc:
+            error, busy = f"Gemini ({model}): {exc}", False
+            continue
+        if resp.status_code != 200:
+            error = f"Gemini ({model}) {resp.status_code}: {resp.text[:300]}"
+            busy = resp.status_code in (429, 503)
+            if busy:
+                wait = 20 * (attempt + 1)  # перегрузка проходит не за секунды
+            if resp.status_code == 404:
+                problem(f"gemini404:{model}", f"Модель Gemini «{model}» не найдена: похоже, Google снял её "
+                                              f"с поддержки. Поменяйте её название в news.yml или bot.py.")
+                break
+            if resp.status_code in (400, 401, 403):  # ключ неверный — повтор не поможет
+                problem("gemini-key", f"Gemini не принимает ключ или запрос ({resp.status_code}). "
+                                      f"Проверьте секрет GEMINI_API_KEY.")
+                break
+            continue
+        try:
+            return json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+        except (KeyError, IndexError, ValueError) as exc:
+            error, busy = f"Gemini ({model}) вернул испорченный ответ: {exc}", False
+    raise (Overloaded if busy else TranslationError)(error)
+
+
+def gemini_any(prompt, schema):
+    """Оценки и проверка повторов: сначала лёгкая модель, если она перегружена — сильная."""
+    error = None
+    for model in dict.fromkeys([GEMINI_MODEL, GEMINI_TEXT_MODEL]):
+        try:
+            return gemini(prompt, schema, model, attempts=2)
+        except TranslationError as exc:
+            error = exc
+            print(f"[!] {exc}")
+    raise error
+
+
+def rate_stories(pool):
+    """Gemini оценивает новые сюжеты пачками по 60: важность в рубрике и для всех."""
+    if not GEMINI_API_KEY:
+        return
+    todo = [s for s in pool if s["importance"] is None and s.get("rate_tries", 0) < 3][:180]
+    for start in range(0, len(todo), 60):
+        batch = todo[start:start + 60]
+        lines = []
+        for n, story in enumerate(batch, 1):
+            m = story["members"][0]
+            lines.append(f"{n}. [{CATEGORY_BY_KEY[story['category']]['title']}] {m['title']} — {m['summary'][:200]}")
+        try:
+            scores = gemini_any(RATE_PROMPT + "\n".join(lines), RATE_SCHEMA)
+            if not isinstance(scores, list) or len(scores) != len(batch):
+                raise TranslationError("ответ не той длины")
+            for story, value in zip(batch, scores):
+                story["importance"] = max(1, min(10, int(value["topic"])))
+                story["world"] = max(1, min(10, int(value["world"])))
+        except Overloaded as exc:
+            # Временная перегрузка: попытку не считаем, сюжеты ждут оценки, а не выходят без отбора
+            problem("rate", f"Gemini перегружен и не смог оценить новости: {exc}. "
+                            f"Новости ждут оценки, бот попробует в следующий запуск.")
+            break
+        except Exception as exc:
+            problem("rate", f"Gemini не смог оценить важность новостей: {exc}. "
+                            f"Пока это так, бот публикует почти без отбора.")
+            for story in batch:
+                story["rate_tries"] = story.get("rate_tries", 0) + 1
+            break
+        time.sleep(2)
+
+
+def is_repeat(story, recent):
+    """Запись об уже опубликованной новости о том же событии ({title, msg, …}) или None.
+    Сначала быстрое сравнение по смыслу, в спорных случаях решает Gemini."""
+    if not recent:
+        return None
+    titles = [m["title"] for m in story["members"]]
+    recent = recent[-500:]  # последние сюжеты — этого хватает и не замедляет запуск
+    old = [r["title"] for r in recent]
+    sims, semantic = dedup.similarity(titles, old)
+    best = sims.max(axis=0)  # сходство каждой опубликованной новости с ближайшей статьёй сюжета
+    loose = 0.45 if semantic else 0.25  # мягкий порог: кандидаты на проверку
+    close = [int(j) for j in np.argsort(-best)[:8] if best[j] >= loose]
+    if not close:
+        return None
+    for j in close:
+        for i, title in enumerate(titles):
+            if dedup.same_story(sims[i, j], title, old[j], semantic):
+                return recent[j]
+    if not GEMINI_API_KEY:
+        return None
+    main = story["members"][0]
+    text = (f"Новая: {main['title']} — {main['summary'][:300]}\n\nОпубликованные:\n"
+            + "\n".join(f"{n}. {old[j]}" for n, j in enumerate(close, 1)))
+    try:
+        answer = gemini_any(REPEAT_PROMPT + text, {"type": "OBJECT", "properties": {"repeat": {"type": "INTEGER"}},
+                                                   "required": ["repeat"]})
         number = int(answer.get("repeat", 0))
     except Exception as exc:
         print(f"[!] не удалось проверить повтор: {exc}")
