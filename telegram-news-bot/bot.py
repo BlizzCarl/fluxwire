@@ -796,14 +796,17 @@ def gemini(prompt, schema, model=None, attempts=3, temperature=0.2):
         try:
             resp = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=120,
+                headers={"x-goog-api-key": GEMINI_API_KEY}, json=body, timeout=(10, 90),
             )
         except requests.RequestException as exc:
-            error, busy = f"Gemini ({model}): {exc}", False
+            # таймаут и обрыв связи — временно: сюжеты ждут оценки, а не выходят без отбора
+            error, busy = f"Gemini ({model}): {exc}", True
             continue
         if resp.status_code != 200:
             error = f"Gemini ({model}) {resp.status_code}: {resp.text[:300]}"
-            busy = resp.status_code in (429, 503)
+            busy = resp.status_code in (429, 500, 503, 504)
+            if resp.status_code == 429 and "quota" in resp.text.lower():
+                break  # лимит исчерпан — повтор через минуту не поможет, пробуем другую модель
             if busy:
                 wait = 20 * (attempt + 1)  # перегрузка проходит не за секунды
             if resp.status_code == 404:
@@ -839,8 +842,8 @@ def rate_stories(pool):
     if not GEMINI_API_KEY:
         return
     todo = [s for s in pool if s["importance"] is None and s.get("rate_tries", 0) < 3][:180]
-    for start in range(0, len(todo), 60):
-        batch = todo[start:start + 60]
+    for start in range(0, len(todo), 25):
+        batch = todo[start:start + 25]
         lines = []
         for n, story in enumerate(batch, 1):
             m = story["members"][0]
